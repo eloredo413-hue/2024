@@ -2,9 +2,9 @@
 -- Run AFTER the main Bloxy Paradox script.
 --
 -- "2023 new" is now "2024": it loads the 2024 GUI (2024-gui.lua), which
--- sets the 2023 new GUI's fast flags, rejoins like it did, and shows the
--- 2024 top bar (Old Chrome 2024) instead of the 2023 one. The 2023 new
--- GUI's chat icon (LegacyChatIcon) is not part of it.
+-- sets the 2023 new GUI's fast flags, rejoins like it did, then loads the
+-- 2024 top bar (Old Chrome 2024) and the 2023 new GUI's chat. The 2023
+-- new GUI's chat icon (LegacyChatIcon) is not part of it.
 
 ------------------------------------------------------------
 -- PART 1: LOADSTRING HOOK
@@ -95,7 +95,7 @@ do
 
 			-- "new" is what the old "2023 new" button set.
 			if variant == "2024" or variant == "new" then
-				print("[2024 Hook] Loading the 2024 GUI (2023 flags + 2024 top bar)...")
+				print("[2024 Hook] Loading the 2024 GUI (2023 flags, rejoin, 2024 top bar, 2023 chat)...")
 				local src = fetchURL(URL_2024, "2024")
 				if src then return _ORIG_LS(src, name) end
 				warn("[2024 Hook] Fetch failed — falling back to base 2023.")

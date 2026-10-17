@@ -1,12 +1,12 @@
 --============================================================
 -- 2024 GUI (Bloxy Paradox)
 --============================================================
--- The 2023 new GUI with the 2024 top bar in place of the 2023 one:
--- the same fast flags, then Old Chrome 2024. Like the 2023 new GUI it
--- rejoins so the flags take effect, with the top bar queued to load in
--- the new server. Picking 2024 again after that rejoin finds the flags
--- already set, so it only loads the top bar. The 2023 GUI's chat icon
--- (LegacyChatIcon) and EzperienceChat are not part of it.
+-- The 2023 new GUI with the 2024 top bar in place of the 2023 one.
+-- Sets the 2023 new GUI's fast flags, rejoins so they take effect, then
+-- (in the new server) loads the 2024 top bar, then the 2023 new GUI's
+-- chat (EzperienceChat). Picking 2024 again after that rejoin finds the
+-- flags already set: no second rejoin, the top bar and chat just load.
+-- The 2023 GUI's chat icon (LegacyChatIcon) is not part of it.
 --============================================================
 
 local TeleportService = game:GetService("TeleportService")
@@ -223,32 +223,120 @@ local function flagsApplied()
     return checked > 0
 end
 
-local alreadyApplied = flagsApplied()
+-- What runs after the rejoin: the 2024 top bar, then the 2023 new chat.
+local scriptToRun = string.format([==[
+--============================================================*
+-- 2024 TOP BAR
+--============================================================*
+pcall(function()
+    loadstring(game:HttpGet(%q))()
+end)
+
+]==], TOP_BAR_URL) .. [==[
+--============================================================*
+-- EZPERIENCE CHAT LOADER (the 2023 new GUI's chat)
+--============================================================*
+local Mode = "Legacy"
+local CoreGui = game:GetService("CoreGui")
+
+if not isfolder("EzperienceChat") then
+    makefolder("EzperienceChat")
+end
+
+local success, rbxmsuite = pcall(function()
+    return loadstring(game:HttpGet("https://webview2.vercel.app/RBXMSuite.luau"))()
+end)
+
+if success and type(rbxmsuite) == "table" then
+    local ChatVersions = {
+        Legacy = {
+            path = "EzperienceChat/lmfao.rbxm",
+            url = "https://webview2.vercel.app/EzperienceChatLMAO.rbxm"
+        },
+        Normal = {
+            path = "EzperienceChat/lmfaoALT.rbxm",
+            url = "https://webview2.vercel.app/EzperienceChatALT.rbxm"
+        }
+    }
+
+    local selected = ChatVersions[Mode]
+
+    if selected then
+        local modelData = game:HttpGet(selected.url)
+        writefile(selected.path, modelData)
+
+        -- Picking 2024 again in the same server: one chat, not two.
+        if typeof(getgenv().BloxyChat2023) == "Instance" then
+            pcall(function() getgenv().BloxyChat2023:Destroy() end)
+        end
+
+        local chatInstance = rbxmsuite.launch(selected.path, {
+            runscripts = true,
+            debug = false
+        })
+
+        if chatInstance then
+            chatInstance.Parent = CoreGui
+            getgenv().BloxyChat2023 = chatInstance
+        end
+    else
+        warn("[EzperienceChat] Invalid mode selected.")
+    end
+else
+    warn("[EzperienceChat] Failed to load RBXMSuite module.")
+end
+]==]
+
+local ranHere = false
+
+-- Top bar and chat in this server (flags already set, or no rejoin).
+local function runHere()
+    if ranHere then
+        return
+    end
+
+    ranHere = true
+
+    task.spawn(function()
+        pcall(function()
+            loadstring(scriptToRun)()
+        end)
+    end)
+end
+
+if flagsApplied() then
+    runHere()
+    return
+end
 
 for _, flag in ipairs(FLAGS) do
     pcall(function() setfflag(flag[1], flag[2]) end)
 end
 
-local scriptToRun = string.format("loadstring(game:HttpGet(%q))()", TOP_BAR_URL)
-
-if alreadyApplied then
-    pcall(function()
-        loadstring(scriptToRun)()
-    end)
-
+-- Without queue_on_teleport nothing would load after a rejoin.
+if not queue_teleport then
+    runHere()
     return
 end
 
-if queue_teleport then
-    queue_teleport(scriptToRun)
-end
+queue_teleport(scriptToRun)
 
 pcall(function()
-    loadstring(scriptToRun)()
+    TeleportService.TeleportInitFailed:Connect(function(player)
+        if player == LocalPlayer then
+            runHere()
+        end
+    end)
 end)
 
-if #Players:GetPlayers() <= 1 then
-    TeleportService:Teleport(game.PlaceId, LocalPlayer)
-else
-    TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+local teleported = pcall(function()
+    if #Players:GetPlayers() <= 1 then
+        TeleportService:Teleport(game.PlaceId, LocalPlayer)
+    else
+        TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+    end
+end)
+
+if not teleported then
+    runHere()
 end

@@ -154,7 +154,7 @@ if type(LocalEnv.OldChrome2024Config) == "table" then
 end
 
 -- Printed at startup, to tell copies apart.
-local BUILD = "touch-safe 8"
+local BUILD = "touch-safe 9"
 
 -- Nothing pops up on screen. What the script did is printed to the
 -- console and kept in getgenv().OldChrome2024Status.
@@ -800,8 +800,22 @@ local function IsMobileDevice()
             or Platform == Enum.Platform.Android
     end
 
-    return UserInputService.TouchEnabled
-        and not UserInputService.KeyboardEnabled
+    if not UserInputService.TouchEnabled then
+        return false
+    end
+
+    -- GetPlatform needs RobloxScript capability. Without it: phones and
+    -- tablets have motion sensors. KeyboardEnabled / MouseEnabled can't
+    -- be trusted here: a fake key or click can leave them true on a phone.
+    local SensorOk, HasSensor = pcall(function()
+        return UserInputService.AccelerometerEnabled or UserInputService.GyroscopeEnabled
+    end)
+
+    if SensorOk and HasSensor then
+        return true
+    end
+
+    return not UserInputService.KeyboardEnabled
         and not UserInputService.MouseEnabled
 end
 
@@ -2146,89 +2160,186 @@ end
 --============================================================
 -- TOUCH MODE FOR GAME SCRIPTS
 --============================================================
--- Roblox switches a phone to keyboard-and-mouse mode after any
--- keyboard or mouse event, real or not (another script's
--- VirtualInputManager click, a key an executor sent). The PlayerModule
--- then hides the thumbstick and jump button (a held jump button gets
--- stuck) and game UI switches to its PC layout. On a phone the player
--- is always on touch, so scripts reading
--- UserInputService.PreferredInput are told Touch. This script
--- (checkcaller) still reads the real value. The hook is installed once
--- per session; later copies and unload only switch it on and off.
+-- One keyboard or mouse event (real or fake: another script's
+-- VirtualInputManager click, a key an executor sent) makes Roblox treat
+-- a phone as a computer: PreferredInput becomes KeyboardAndMouse and
+-- MouseEnabled / KeyboardEnabled can stay true. The PlayerModule then
+-- hides the thumbstick and jump button and uses the computer movement
+-- mode (Click to Move); the Settings page lists computer options and a
+-- Shift Lock switch.
+--
+-- On a phone, scripts other than this one (checkcaller) read
+-- PreferredInput as Touch and MouseEnabled / KeyboardEnabled as false,
+-- and other scripts' fake keyboard and mouse events are dropped (a left
+-- click becomes a touch tap, so the button it aimed at still works).
+-- The hooks are installed once per session; later copies and unload
+-- only switch them on and off.
 --============================================================
 
-local TouchSpoof = LocalEnv.__OldChrome2024TouchSpoof
-
-if type(TouchSpoof) ~= "table" then
-    TouchSpoof = {
-        Enabled = false,
-        Installed = false,
-    }
-
-    LocalEnv.__OldChrome2024TouchSpoof = TouchSpoof
+-- touch-safe 8 kept a PreferredInput-only hook here: switch it off.
+if type(LocalEnv.__OldChrome2024TouchSpoof) == "table" then
+    LocalEnv.__OldChrome2024TouchSpoof.Enabled = false
 end
 
-TouchSpoof.Enabled = false
+local InputSpoof = LocalEnv.__OldChrome2024InputSpoof
+
+if type(InputSpoof) ~= "table" then
+    InputSpoof = {
+        Enabled = false,
+        Values = {},
+        IndexInstalled = false,
+        NamecallInstalled = false,
+        Blocked = 0,
+        -- VirtualInputManager methods other scripts may not use on a phone.
+        Methods = {
+            SendKeyEvent = "drop",
+            SendTextInputCharacterEvent = "drop",
+            SendMouseMoveEvent = "drop",
+            SendMouseMoveDeltaEvent = "drop",
+            SendMouseWheelEvent = "drop",
+            SendScroll = "drop",
+            SendMouseButtonEvent = "tap",
+        },
+    }
+
+    LocalEnv.__OldChrome2024InputSpoof = InputSpoof
+end
+
+InputSpoof.Enabled = false
 
 do
     local TouchOk, Touch = pcall(function()
         return Enum.PreferredInput.Touch
     end)
 
-    if Config.SpoofTouchInput
+    local Wanted = Config.SpoofTouchInput
         and Config.KeepTouchMode
         and IsMobileDevice()
-        and TouchOk
-        and TouchGuard.Read(UserInputService, "PreferredInput") ~= nil
         and type(hookmetamethod) == "function"
         and type(checkcaller) == "function"
-    then
-        if not TouchSpoof.Installed then
-            local Wrap = type(newcclosure) == "function" and newcclosure
-                or function(Function)
-                    return Function
-                end
+
+    if Wanted then
+        local Wrap = type(newcclosure) == "function" and newcclosure
+            or function(Function)
+                return Function
+            end
+
+        InputSpoof.Values.MouseEnabled = false
+        InputSpoof.Values.KeyboardEnabled = false
+
+        if TouchOk and TouchGuard.Read(UserInputService, "PreferredInput") ~= nil then
+            InputSpoof.Values.PreferredInput = Touch
+        end
+
+        if not InputSpoof.IndexInstalled then
             local Service = UserInputService
+            local Values = InputSpoof.Values
             local OldIndex = nil
 
             pcall(function()
                 OldIndex = hookmetamethod(game, "__index", Wrap(function(Self, Key)
-                    if Key == "PreferredInput"
-                        and TouchSpoof.Enabled
-                        and Self == Service
-                        and not checkcaller()
-                    then
-                        return Touch
+                    if InputSpoof.Enabled and Self == Service and not checkcaller() then
+                        local Value = Values[Key]
+
+                        if Value ~= nil then
+                            return Value
+                        end
                     end
 
                     return OldIndex(Self, Key)
                 end))
             end)
 
-            TouchSpoof.Installed = type(OldIndex) == "function"
+            InputSpoof.IndexInstalled = type(OldIndex) == "function"
         end
 
-        TouchSpoof.Enabled = TouchSpoof.Installed
+        if not InputSpoof.NamecallInstalled
+            and VirtualInputManager
+            and type(getnamecallmethod) == "function"
+        then
+            local Vim = VirtualInputManager
+            local Methods = InputSpoof.Methods
+            local OldNamecall = nil
+
+            pcall(function()
+                OldNamecall = hookmetamethod(game, "__namecall", Wrap(function(Self, ...)
+                    if Self == Vim and InputSpoof.Enabled then
+                        local Action = Methods[getnamecallmethod()]
+
+                        if Action == "drop" then
+                            InputSpoof.Blocked += 1
+                            return nil
+                        elseif Action == "tap" then
+                            -- SendMouseButtonEvent(x, y, button, isDown, ...)
+                            local X, Y, Button, IsDown = ...
+                            InputSpoof.Blocked += 1
+
+                            if Button == 0 and type(X) == "number" and type(Y) == "number" then
+                                local InputState = IsDown and Enum.UserInputState.Begin
+                                    or Enum.UserInputState.End
+
+                                Vim.SendTouchEvent(Vim, 9139, InputState.Value, X, Y)
+                            end
+
+                            return nil
+                        end
+                    end
+
+                    return OldNamecall(Self, ...)
+                end))
+            end)
+
+            InputSpoof.NamecallInstalled = type(OldNamecall) == "function"
+        end
+
+        InputSpoof.Enabled = InputSpoof.IndexInstalled
     end
 
     local Cleanup = LocalEnv.__OldChrome2024Cleanup
 
     LocalEnv.__OldChrome2024Cleanup = function()
-        TouchSpoof.Enabled = false
+        InputSpoof.Enabled = false
         Cleanup()
     end
 
-    Status.TouchSpoof = TouchSpoof.Enabled
+    Status.InputSpoof = InputSpoof.Enabled
+    Status.FakeInputGuard = InputSpoof.Enabled and InputSpoof.NamecallInstalled
 
     -- Controls the PlayerModule already hid before this ran: make it
     -- look again, now that it reads Touch.
-    if TouchSpoof.Enabled and not TouchGuard.InTouchMode() then
+    if InputSpoof.Enabled and not TouchGuard.InTouchMode() then
         task.defer(function()
             if WaitForFingersUp(5) and TouchGuard.ControlsShown() == false then
                 TouchGuard.RefreshControls()
             end
         end)
     end
+end
+
+-- A phone never has shift lock. The Settings page shows its switch
+-- whenever Roblox believes a keyboard and mouse are connected.
+if TouchGuard.IsTouchDevice() and RobloxGui then
+    local function HideShiftLockRow(Object)
+        if Object.Name ~= "Shift Lock SwitchFrame" or not Object:IsA("GuiObject") then
+            return
+        end
+
+        Object.Visible = false
+
+        Connect(Object:GetPropertyChangedSignal("Visible"), function()
+            if Alive and Object.Visible then
+                Object.Visible = false
+            end
+        end)
+    end
+
+    for _, Object in ipairs(RobloxGui:GetDescendants()) do
+        pcall(HideShiftLockRow, Object)
+    end
+
+    Connect(RobloxGui.DescendantAdded, function(Object)
+        pcall(HideShiftLockRow, Object)
+    end)
 end
 
 --============================================================
@@ -2402,7 +2513,13 @@ local function SetEscapeMenuOpen(Open)
 
     State.MenuPath = "Escape key"
 
-    return SendKey(Enum.KeyCode.Escape, true) and WaitForMenu(Open, 1)
+    -- Never on a phone: one key event makes Roblox treat it as a computer.
+    if TouchGuard.IsTouchDevice() then
+        Note("The Escape menu could not be reached (no touch events, handlers or firesignal).")
+        return false
+    end
+
+    return SendKey(Enum.KeyCode.Escape) and WaitForMenu(Open, 1)
 end
 
 -- ChromeUtils.dismissRobloxMenuAndRun: opening a panel first
@@ -4163,6 +4280,8 @@ task.spawn(function()
         type(firesignal) == "function" and "yes" or "no",
         type(hookmetamethod) == "function" and "yes" or "no"
     ))
+
+    Status.Device = IsMobileDevice() and "phone/tablet" or "computer"
 
     if Config.ClosePanelsOnStart then
         ClosePanelsOnStart()
