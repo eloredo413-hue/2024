@@ -1037,26 +1037,77 @@ local function FireSignal(Signal)
     return false
 end
 
--- AllowOnTouch is only used to open the Escape menu as a last resort:
--- the menu covers the touch controls, and the next tap inside it
--- switches input back to touch.
+-- Invisible, full-screen and above everything (our ScreenGui has the
+-- highest DisplayOrder). Shown for a couple of frames so a synthetic
+-- tap lands on it and nowhere else, whatever its exact coordinates.
+local TouchSink = Instance.new("ImageButton")
+TouchSink.Name = "__OldChrome2024TouchSink"
+TouchSink.BackgroundTransparency = 1
+TouchSink.ImageTransparency = 1
+TouchSink.AutoButtonColor = false
+TouchSink.Active = true
+TouchSink.Visible = false
+TouchSink.Position = UDim2.fromOffset(-200, -200)
+TouchSink.Size = UDim2.new(1, 400, 1, 400)
+TouchSink.ZIndex = 100000
+TouchSink.Parent = TopBarApp
+
+local TOUCH_SINK_ID = 9137
+
+-- A synthetic key switches a touch device to keyboard-and-mouse mode:
+-- a cursor appears and the thumbstick / jump button hide. One
+-- synthetic tap on the sink switches it straight back to touch.
+local function RestoreTouchInput()
+    if not VirtualInputManager or not UserInputService.TouchEnabled then
+        return
+    end
+
+    local Size = GetViewportSize()
+    local X, Y = Size.X / 2, Size.Y / 2
+
+    State.LastOwnActivation = os.clock()
+    TouchSink.Visible = true
+
+    pcall(function()
+        VirtualInputManager:SendTouchEvent(TOUCH_SINK_ID, Enum.UserInputState.Begin.Value, X, Y)
+        task.wait()
+        VirtualInputManager:SendTouchEvent(TOUCH_SINK_ID, Enum.UserInputState.End.Value, X, Y)
+    end)
+
+    task.wait()
+    TouchSink.Visible = false
+end
+
+-- Native paths are always tried first. Without AllowOnTouch, touch
+-- devices never get synthetic keys; with it (the Escape menu, which
+-- has no other way in on some executors) touch mode is restored
+-- right after the key.
 local function SendKey(KeyCode, AllowOnTouch)
     if not VirtualInputManager then
         return false
     end
 
-    if not AllowOnTouch and not IsKeyboardAndMouse() then
+    local OnTouch = not IsKeyboardAndMouse()
+
+    if OnTouch and not AllowOnTouch then
         return false
     end
 
     -- Our own InputBegan handler must not treat this as a user press.
     SyntheticKeyUntil[KeyCode] = os.clock() + 0.35
 
-    return pcall(function()
+    local Ok = pcall(function()
         VirtualInputManager:SendKeyEvent(true, KeyCode, false, game)
         task.wait(0.03)
         VirtualInputManager:SendKeyEvent(false, KeyCode, false, game)
     end)
+
+    if OnTouch then
+        task.wait()
+        RestoreTouchInput()
+    end
+
+    return Ok
 end
 
 local function MetaIndex(Table)
@@ -1389,7 +1440,7 @@ local function SetEscapeMenuOpen(Open)
         return true
     end
 
-    return SendKey(Enum.KeyCode.Escape, Open) and WaitForMenu(Open, 1)
+    return SendKey(Enum.KeyCode.Escape, true) and WaitForMenu(Open, 1)
 end
 
 -- ChromeUtils.dismissRobloxMenuAndRun: opening a panel first
@@ -3112,7 +3163,7 @@ end)
 
 print("")
 print("============================================================")
-print("OLD CHROME 2024 READY  (build: touch-safe 3)")
+print("OLD CHROME 2024 READY  (build: touch-safe 4)")
 print("============================================================")
 print("Original TopBarApp disabled:", #NativeTopBars)
 print("RobloxGui:", RobloxGui and "LEFT ENABLED" or "NOT FOUND")
