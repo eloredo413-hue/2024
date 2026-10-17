@@ -32,11 +32,22 @@
 --   Chat, PlayerList, Backpack, Emotes and the Escape menu are the
 --   real Roblox ones. Buttons call the same native objects the 2024
 --   integrations called (PlayerList controller, BackpackScript,
---   SettingsHub) when the executor provides getgc, and otherwise
---   fall back to the native hotkeys (Tab / Backquote / Escape).
+--   SettingsHub) when the executor provides getgc. Otherwise they use
+--   the disabled native top bar's own buttons, or call the native key
+--   handler directly.
 --
---   Phones need the native path: the PlayerList ignores Tab on
---   small touch screens, so a synthetic Tab can never open it there.
+--   Synthetic key presses (Tab / Backquote / Escape) are only sent to
+--   keyboard-and-mouse players. On touch, one fake key press switches
+--   Roblox to keyboard mode: a cursor appears and the thumbstick and
+--   jump button disappear until the next touch.
+--
+-- PHONES AND TABLETS
+--
+--   The Roblox button opens the menu with a synthetic touch on
+--   Roblox's own (disabled) button, so the CoreScript handles it like
+--   a real tap and the device stays in touch mode. The cursor is kept
+--   hidden, and touch mode is restored at once if any stray keyboard
+--   or mouse event switches the game out of it.
 --
 --   Icon states are read back from the native UI (event driven,
 --   with a light 4 Hz poll as a safety net), so the native hotkeys
@@ -57,6 +68,8 @@
 --
 -- Settings can be overridden before executing:
 --   getgenv().OldChrome2024Config = { ClosePanelsOnStart = false }
+--   (HideCursorOnTouch / KeepTouchMode = false for a tablet used
+--   with a real mouse or keyboard)
 --
 --============================================================
 
@@ -77,9 +90,19 @@ local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 
 local VirtualInputManager = nil
+local GamepadService = nil
+local ContextActionService = nil
 
 pcall(function()
     VirtualInputManager = game:GetService("VirtualInputManager")
+end)
+
+pcall(function()
+    GamepadService = game:GetService("GamepadService")
+end)
+
+pcall(function()
+    ContextActionService = game:GetService("ContextActionService")
 end)
 
 --============================================================
@@ -101,6 +124,13 @@ local Config = {
     -- integration follows the game's SetCoreGuiEnabled like 2024.
     ForceEnableCoreGui = false,
 
+    -- Phones and tablets: never show the mouse cursor (the Escape menu
+    -- forces it on), and go straight back to touch mode whenever a
+    -- stray keyboard/mouse event switches the game out of it. Turn
+    -- these off when using a real mouse or keyboard on a tablet.
+    HideCursorOnTouch = true,
+    KeepTouchMode = true,
+
     Verbose = false,
 }
 
@@ -109,6 +139,9 @@ if type(LocalEnv.OldChrome2024Config) == "table" then
         Config[Key] = Value
     end
 end
+
+-- Shown in the startup notification and print, to tell copies apart.
+local BUILD = "touch-safe 7"
 
 local function Log(...)
     if Config.Verbose then
@@ -205,6 +238,10 @@ end
 local NativeTopBars = {}
 local WatchedTopBars = {}
 
+-- Open while a synthetic touch is aimed at the native Roblox button,
+-- which needs its TopBarApp enabled for two frames.
+local NativeBarHold = { Open = false }
+
 local function IsNativeTopBar(Object)
     return Object.Name == "TopBarApp"
         and Object:IsA("LayerCollector")
@@ -221,7 +258,7 @@ local function DisableNativeTopBar(Object)
 
         -- Keep it disabled if anything turns it back on.
         Connect(Object:GetPropertyChangedSignal("Enabled"), function()
-            if Alive and Object.Enabled then
+            if Alive and Object.Enabled and not NativeBarHold.Open then
                 pcall(function()
                     Object.Enabled = false
                 end)
@@ -650,6 +687,7 @@ local Native = {
     Backpack = nil,
     Settings = nil,
     Chrome = nil,
+    Controls = nil,
     ReportPageOpen = false,
 }
 
@@ -761,12 +799,41 @@ local function ComputeSlotLimit()
     return 2
 end
 
-local function MouseHoverAllowed()
-    if not UserInputService.MouseEnabled then
+-- The PlayerModule (ControlModule:UpdateTouchGuiVisibility) only
+-- shows the thumbstick and jump button while PreferredInput is Touch.
+-- One synthetic key event switches PreferredInput to KeyboardAndMouse:
+-- the touch controls disappear and a mouse cursor shows until the next
+-- real touch. Native hotkeys are therefore only ever emulated for a
+-- player who is actually on keyboard and mouse.
+local function IsKeyboardAndMouse()
+    -- Phones and tablets never count, whatever PreferredInput currently
+    -- says: it may already have been flipped by an earlier fake key or
+    -- by an executor overlay.
+    if IsMobileDevice()
+        or (UserInputService.TouchEnabled and not UserInputService.MouseEnabled)
+    then
         return false
     end
 
-    return UserInputService:GetLastInputType() ~= Enum.UserInputType.Touch
+    local Ok, Result = pcall(function()
+        return UserInputService.PreferredInput == Enum.PreferredInput.KeyboardAndMouse
+    end)
+
+    if Ok then
+        return Result
+    end
+
+    -- Clients without PreferredInput.
+    if not UserInputService.TouchEnabled then
+        return true
+    end
+
+    return UserInputService.KeyboardEnabled
+        and UserInputService:GetLastInputType() ~= Enum.UserInputType.Touch
+end
+
+local function MouseHoverAllowed()
+    return UserInputService.MouseEnabled and IsKeyboardAndMouse()
 end
 
 --============================================================
@@ -950,43 +1017,163 @@ end
 -- NATIVE COREUI ACCESS
 --============================================================
 
-local function FireSignal(Signal)
-    if type(firesignal) == "function" then
-        if pcall(firesignal, Signal) then
-            return true
+local function GetConnectionList(Signal)
+    if type(getconnections) ~= "function" then
+        return nil
+    end
+
+    local Ok, Result = pcall(getconnections, Signal)
+
+    if Ok and type(Result) == "table" then
+        return Result
+    end
+
+    return nil
+end
+
+local function GetHandler(Item)
+    local Handler = nil
+
+    pcall(function()
+        Handler = Item.Function
+    end)
+
+    if type(Handler) == "function" then
+        return Handler
+    end
+
+    return nil
+end
+
+-- Calls a signal's connected handlers directly. A plain Lua call
+-- cannot generate input. False when no handler can be reached (some
+-- executors hide the CoreScripts' functions).
+local function CallHandlers(Signal)
+    local List = GetConnectionList(Signal)
+    local Called = false
+
+    for _, Item in ipairs(List or {}) do
+        local Handler = GetHandler(Item)
+
+        if Handler then
+            Called = true
+
+            task.spawn(function()
+                pcall(Handler)
+            end)
         end
     end
 
-    if type(getconnections) == "function" then
-        local Ok, List = pcall(getconnections, Signal)
+    return Called
+end
 
-        if Ok and type(List) == "table" and #List > 0 then
-            for _, Item in ipairs(List) do
-                pcall(function()
-                    Item:Fire()
-                end)
-            end
+-- firesignal / :Fire(). How an executor implements these is unknown;
+-- some click the button with simulated mouse input, which switches a
+-- phone to keyboard-and-mouse mode.
+local function SimulateSignal(Signal)
+    if type(firesignal) == "function" and pcall(firesignal, Signal) then
+        return true
+    end
 
-            return true
+    local List = GetConnectionList(Signal)
+
+    if List and #List > 0 then
+        for _, Item in ipairs(List) do
+            pcall(function()
+                Item:Fire()
+            end)
         end
+
+        return true
     end
 
     return false
 end
 
-local function SendKey(KeyCode)
+local function FireSignal(Signal)
+    return CallHandlers(Signal) or SimulateSignal(Signal)
+end
+
+-- Invisible, full-screen and above everything (our ScreenGui has the
+-- highest DisplayOrder). Shown for a couple of frames so a synthetic
+-- tap lands on it and nowhere else, whatever its exact coordinates.
+local TouchSink = Instance.new("ImageButton")
+TouchSink.Name = "__OldChrome2024TouchSink"
+TouchSink.BackgroundTransparency = 1
+TouchSink.ImageTransparency = 1
+TouchSink.AutoButtonColor = false
+TouchSink.Active = true
+TouchSink.Visible = false
+TouchSink.Position = UDim2.fromOffset(-200, -200)
+TouchSink.Size = UDim2.new(1, 400, 1, 400)
+TouchSink.ZIndex = 100000
+TouchSink.Parent = TopBarApp
+
+local TOUCH_SINK_ID = 9137
+
+-- A synthetic key switches a touch device to keyboard-and-mouse mode:
+-- a cursor appears and the thumbstick / jump button hide. One
+-- synthetic tap on the sink switches it straight back to touch.
+local function RestoreTouchInput()
+    if not VirtualInputManager
+        or not UserInputService.TouchEnabled
+        or State.SyntheticTouch
+        or State.NoTouchEvents
+    then
+        return
+    end
+
+    local Size = GetViewportSize()
+    local X, Y = Size.X / 2, Size.Y / 2
+
+    State.SyntheticTouch = true
+    State.LastOwnActivation = os.clock()
+    TouchSink.Visible = true
+
+    if not pcall(function()
+        VirtualInputManager:SendTouchEvent(TOUCH_SINK_ID, Enum.UserInputState.Begin.Value, X, Y)
+        task.wait()
+        VirtualInputManager:SendTouchEvent(TOUCH_SINK_ID, Enum.UserInputState.End.Value, X, Y)
+    end) then
+        -- The executor has no touch events; never try again.
+        State.NoTouchEvents = true
+    end
+
+    task.wait()
+    TouchSink.Visible = false
+    State.SyntheticTouch = false
+end
+
+-- Native paths are always tried first. Without AllowOnTouch, touch
+-- devices never get synthetic keys; with it (the Escape menu, which
+-- has no other way in on some executors) touch mode is restored
+-- right after the key.
+local function SendKey(KeyCode, AllowOnTouch)
     if not VirtualInputManager then
+        return false
+    end
+
+    local OnTouch = not IsKeyboardAndMouse()
+
+    if OnTouch and not AllowOnTouch then
         return false
     end
 
     -- Our own InputBegan handler must not treat this as a user press.
     SyntheticKeyUntil[KeyCode] = os.clock() + 0.35
 
-    return pcall(function()
+    local Ok = pcall(function()
         VirtualInputManager:SendKeyEvent(true, KeyCode, false, game)
         task.wait(0.03)
         VirtualInputManager:SendKeyEvent(false, KeyCode, false, game)
     end)
+
+    if OnTouch then
+        task.wait()
+        RestoreTouchInput()
+    end
+
+    return Ok
 end
 
 local function MetaIndex(Table)
@@ -1032,6 +1219,16 @@ local function ClassifyNative(Value)
         and type(rawget(Value, "_subMenuConfig")) == "table"
     then
         Native.Chrome = Value
+    elseif type(rawget(Value, "controllers")) == "table" then
+        -- The game's PlayerModule ControlModule (thumbstick / jump).
+        local Index = MetaIndex(Value)
+
+        if Index
+            and type(rawget(Index, "SwitchToController")) == "function"
+            and type(rawget(Index, "UpdateTouchGuiVisibility")) == "function"
+        then
+            Native.Controls = Value
+        end
     end
 end
 
@@ -1088,6 +1285,288 @@ local function FireNativeHitArea(Id)
 
         if Button and Button:IsA("GuiButton") then
             return FireSignal(Button.Activated)
+        end
+    end
+
+    return false
+end
+
+-- The disabled native top bar's own Roblox button
+-- (MenuIconHolder / MenuIcon > MenuIconTriggerPoint). Its handler
+-- is SettingsHub:ToggleVisibility, so firing it needs no key event.
+local function FindNativeMenuButton()
+    for _, Object in ipairs(NativeTopBars) do
+        for _, Name in ipairs({ "MenuIconHolder", "MenuIcon", "MenuIconTriggerPoint" }) do
+            local Holder = Object:FindFirstChild(Name, true)
+            local Button = Holder
+                and (Holder:IsA("GuiButton") and Holder
+                    or Holder:FindFirstChildWhichIsA("GuiButton", true))
+
+            if Button then
+                return Button
+            end
+        end
+    end
+
+    return nil
+end
+
+local function FireNativeMenuButton()
+    local Button = FindNativeMenuButton()
+
+    return Button ~= nil and FireSignal(Button.Activated)
+end
+
+-- Covers the whole screen except one rectangle, so a synthetic touch
+-- can reach nothing but the button under that hole. The backstop sits
+-- just below the target's ScreenGui: a touch that misses the button
+-- ends there instead of reaching the game.
+local TapGuard = {
+    Frame = Instance.new("Frame"),
+    Parts = {},
+    Backstop = Instance.new("ScreenGui"),
+}
+
+TapGuard.Backstop.Name = "__OldChrome2024TapBackstop"
+TapGuard.Backstop.IgnoreGuiInset = true
+TapGuard.Backstop.ResetOnSpawn = false
+TapGuard.Backstop.Enabled = false
+
+pcall(function()
+    TapGuard.Backstop:SetAttribute("__OldChrome2024", true)
+end)
+
+do
+    local Catcher = Instance.new("ImageButton")
+    Catcher.Name = "Catcher"
+    Catcher.BackgroundTransparency = 1
+    Catcher.ImageTransparency = 1
+    Catcher.AutoButtonColor = false
+    Catcher.Active = true
+    Catcher.Position = UDim2.fromOffset(-200, -200)
+    Catcher.Size = UDim2.new(1, 400, 1, 400)
+    Catcher.Parent = TapGuard.Backstop
+
+    local Cleanup = LocalEnv.__OldChrome2024Cleanup
+
+    LocalEnv.__OldChrome2024Cleanup = function()
+        pcall(function()
+            TapGuard.Backstop:Destroy()
+        end)
+
+        Cleanup()
+    end
+end
+
+TapGuard.Backstop.Parent = CoreGui
+
+TapGuard.Frame.Name = "__OldChrome2024TapGuard"
+TapGuard.Frame.BackgroundTransparency = 1
+TapGuard.Frame.Size = UDim2.fromScale(1, 1)
+TapGuard.Frame.ZIndex = 100000
+TapGuard.Frame.Visible = false
+TapGuard.Frame.Parent = TopBarApp
+
+for _, Name in ipairs({ "Top", "Bottom", "Left", "Right" }) do
+    local Part = Instance.new("ImageButton")
+    Part.Name = Name
+    Part.BackgroundTransparency = 1
+    Part.ImageTransparency = 1
+    Part.AutoButtonColor = false
+    Part.Active = true
+    Part.ZIndex = 100000
+    Part.Parent = TapGuard.Frame
+    TapGuard.Parts[Name] = Part
+end
+
+-- Screen position of a ScreenGui's origin: the GUI inset, unless it
+-- ignores it (both top bars do).
+local function GuiOrigin(Gui)
+    local Ok, Ignore = pcall(function()
+        return Gui.IgnoreGuiInset
+    end)
+
+    if Ok and Ignore == false then
+        local InsetOk, Inset = pcall(function()
+            return GuiService:GetGuiInset()
+        end)
+
+        if InsetOk and typeof(Inset) == "Vector2" then
+            return Inset
+        end
+    end
+
+    return Vector2.new(0, 0)
+end
+
+function TapGuard.Show(Position, Size)
+    local Left, Top = Position.X, Position.Y
+    local Right, Bottom = Left + Size.X, Top + Size.Y
+    local Parts = TapGuard.Parts
+
+    Parts.Top.Position = UDim2.fromOffset(-200, -200)
+    Parts.Top.Size = UDim2.new(1, 400, 0, Top + 200)
+    Parts.Bottom.Position = UDim2.fromOffset(-200, Bottom)
+    Parts.Bottom.Size = UDim2.new(1, 400, 1, 200 - Bottom)
+    Parts.Left.Position = UDim2.fromOffset(-200, Top)
+    Parts.Left.Size = UDim2.fromOffset(Left + 200, Size.Y)
+    Parts.Right.Position = UDim2.fromOffset(Right, Top)
+    Parts.Right.Size = UDim2.new(1, 200 - Right, 0, Size.Y)
+    TapGuard.Frame.Visible = true
+end
+
+local TOUCH_TAP_ID = 9138
+
+-- Taps a CoreScript button with a synthetic touch. The CoreScript
+-- then handles it exactly like a real tap, and the device stays in
+-- touch mode (a handler called from here, or a firesignal that
+-- clicks, guarantees neither). Everything but the button is covered
+-- meanwhile. EnableGui: the button is in the disabled native top bar,
+-- which is enabled for those two frames.
+local function TapButton(Button, EnableGui)
+    local NativeGui = Button and Button:FindFirstAncestorWhichIsA("LayerCollector")
+    local Deadline = os.clock() + 0.25
+
+    -- A restore tap may be finishing.
+    while State.SyntheticTouch and os.clock() < Deadline do
+        task.wait()
+    end
+
+    if not (VirtualInputManager and NativeGui and MenuIconBackground)
+        or State.SyntheticTouch
+        or State.NoTouchEvents
+    then
+        return false
+    end
+
+    State.SyntheticTouch = true
+    NativeBarHold.Open = EnableGui == true
+
+    local Sent = false
+
+    pcall(function()
+        local Position, Size = Button.AbsolutePosition, Button.AbsoluteSize
+
+        if EnableGui then
+            NativeGui.Enabled = true
+        end
+
+        if Size.X < 8 or Size.Y < 8 then
+            -- Never laid out while it was disabled.
+            task.wait()
+            Position, Size = Button.AbsolutePosition, Button.AbsoluteSize
+        end
+
+        if Size.X < 8 or Size.Y < 8 then
+            return
+        end
+
+        local Screen = Position + GuiOrigin(NativeGui)
+        local Center = Screen + Size / 2
+
+        TapGuard.Show(Screen - GuiOrigin(TopBarApp), Size)
+        TapGuard.Backstop.DisplayOrder = NativeGui.DisplayOrder - 1
+        TapGuard.Backstop.Enabled = true
+        SetProperty(MenuIconBackground, "Interactable", false)
+        State.LastOwnActivation = os.clock()
+
+        Sent = pcall(function()
+            VirtualInputManager:SendTouchEvent(TOUCH_TAP_ID, Enum.UserInputState.Begin.Value, Center.X, Center.Y)
+            task.wait()
+            VirtualInputManager:SendTouchEvent(TOUCH_TAP_ID, Enum.UserInputState.End.Value, Center.X, Center.Y)
+        end)
+
+        -- The executor has no touch events; never try again.
+        State.NoTouchEvents = not Sent
+
+        task.wait()
+    end)
+
+    TapGuard.Frame.Visible = false
+    TapGuard.Backstop.Enabled = false
+    SetProperty(MenuIconBackground, "Interactable", true)
+
+    if EnableGui then
+        pcall(function()
+            NativeGui.Enabled = false
+        end)
+    end
+
+    NativeBarHold.Open = false
+    State.SyntheticTouch = false
+
+    return Sent
+end
+
+local function TapNativeMenuButton()
+    return TapButton(FindNativeMenuButton(), true)
+end
+
+-- "2 of 2" when every handler of the native Roblox button can be
+-- called directly, "0 of 2" when the executor hides them.
+local function DescribeMenuHandlers()
+    local Button = FindNativeMenuButton()
+    local List = Button and GetConnectionList(Button.Activated)
+
+    if not List then
+        return "unknown"
+    end
+
+    local Callable = 0
+
+    for _, Item in ipairs(List) do
+        if GetHandler(Item) then
+            Callable += 1
+        end
+    end
+
+    return string.format("%d of %d", Callable, #List)
+end
+
+-- Calls a CoreScript's own UserInputService.InputBegan handler with a
+-- key, instead of sending a real key event. Nothing reaches the input
+-- system, so PreferredInput (and the touch controls) stay as they are.
+local function CallNativeKeyHandler(SourceName, KeyCode)
+    if type(getconnections) ~= "function" then
+        return false
+    end
+
+    local Ok, List = pcall(getconnections, UserInputService.InputBegan)
+
+    if not Ok or type(List) ~= "table" then
+        return false
+    end
+
+    for _, Item in ipairs(List) do
+        local Handler = nil
+
+        pcall(function()
+            Handler = Item.Function
+        end)
+
+        local SourceOk, Source = false, nil
+
+        if type(Handler) == "function" then
+            SourceOk, Source = pcall(debug.info, Handler, "s")
+        end
+
+        if SourceOk
+            and type(Source) == "string"
+            and string.find(Source, SourceName, 1, true)
+        then
+            local Input = {
+                UserInputType = Enum.UserInputType.Keyboard,
+                UserInputState = Enum.UserInputState.Begin,
+                KeyCode = KeyCode,
+            }
+
+            -- isProcessed = true: only the hotkey runs, not the
+            -- "a tap closes the inventory" branch.
+            task.spawn(function()
+                pcall(Handler, Input, true)
+            end)
+
+            return true
         end
     end
 
@@ -1214,28 +1693,548 @@ function Readers.report()
 end
 
 --============================================================
+-- TOUCH CONTROLS GUARD
+--============================================================
+-- On phones, opening and closing the Escape menu from here can
+-- leave the game's thumbstick and jump button hidden after the
+-- menu is gone, even after real taps. The input state from before
+-- the menu opened is remembered, and once the menu has closed
+-- whatever changed is put back.
+--============================================================
+
+local TouchGuard = {
+    Baseline = nil,
+    Generation = 0,
+    Reports = 0,
+    -- The controls were shown before an earlier menu and never came
+    -- back; the next menu still counts them as shown.
+    Lost = false,
+}
+
+-- Phones and tablets, not touch-screen laptops.
+function TouchGuard.IsTouchDevice()
+    return UserInputService.TouchEnabled == true
+        and (IsMobileDevice() or not UserInputService.MouseEnabled)
+end
+
+function TouchGuard.Read(Object, Property)
+    local Ok, Value = pcall(function()
+        return Object[Property]
+    end)
+
+    if Ok then
+        return Value
+    end
+
+    return nil
+end
+
+function TouchGuard.Short(Value)
+    return string.match(tostring(Value), "[^%.]+$")
+end
+
+function TouchGuard.FindTouchGui()
+    local Player = Players.LocalPlayer
+    local PlayerGui = Player and Player:FindFirstChildOfClass("PlayerGui")
+    local TouchGui = PlayerGui and PlayerGui:FindFirstChild("TouchGui")
+
+    if TouchGui and TouchGui:IsA("ScreenGui") then
+        return TouchGui
+    end
+
+    return nil
+end
+
+-- true / false for the PlayerModule's thumbstick and jump button,
+-- nil when the game has no TouchGui (its own controls).
+function TouchGuard.ControlsShown()
+    local TouchGui = TouchGuard.FindTouchGui()
+    local Frame = TouchGui and TouchGui:FindFirstChild("TouchControlFrame")
+
+    if not Frame then
+        return nil
+    end
+
+    if not TouchGui.Enabled or not Frame.Visible then
+        return false
+    end
+
+    for _, Child in ipairs(Frame:GetChildren()) do
+        if Child:IsA("GuiObject") and Child.Visible then
+            return true
+        end
+    end
+
+    return false
+end
+
+function TouchGuard.InTouchMode()
+    local Preferred = TouchGuard.Read(UserInputService, "PreferredInput")
+
+    if Preferred ~= nil then
+        return Preferred == Enum.PreferredInput.Touch
+    end
+
+    return UserInputService:GetLastInputType() == Enum.UserInputType.Touch
+end
+
+function TouchGuard.Snapshot()
+    if not TouchGuard.IsTouchDevice() then
+        return nil
+    end
+
+    local Shown = TouchGuard.ControlsShown()
+
+    if Shown == false and TouchGuard.Lost then
+        Shown = true
+    end
+
+    return {
+        Shown = Shown,
+        Enabled = TouchGuard.Read(GuiService, "TouchControlsEnabled"),
+        Modal = TouchGuard.Read(UserInputService, "ModalEnabled"),
+        Cursor = TouchGuard.Read(UserInputService, "OverrideMouseIconBehavior"),
+        GamepadCursor = GamepadService and TouchGuard.Read(GamepadService, "GamepadCursorEnabled"),
+    }
+end
+
+-- Puts a property back to its value from before the menu opened.
+function TouchGuard.Restore(Object, Property, Before, Fixed, Label)
+    if Before == nil then
+        return
+    end
+
+    local Now = TouchGuard.Read(Object, Property)
+
+    if Now ~= nil
+        and Now ~= Before
+        and pcall(function()
+            Object[Property] = Before
+        end)
+    then
+        table.insert(Fixed, Label)
+    end
+end
+
+-- The PlayerModule listens to TouchControlsEnabled and works out
+-- its controls again (UpdateMovementMode) when it changes.
+function TouchGuard.RefreshControls()
+    if not GuiService.TouchControlsEnabled then
+        return false
+    end
+
+    pcall(function()
+        GuiService.TouchControlsEnabled = false
+    end)
+
+    task.wait()
+
+    pcall(function()
+        GuiService.TouchControlsEnabled = true
+    end)
+
+    task.wait(0.1)
+
+    return TouchGuard.ControlsShown() == true
+end
+
+-- Last resort: switch the ControlModule (found with getgc) to its
+-- touch controller directly.
+function TouchGuard.ForceControls()
+    local Controls = Native.Controls
+    local Index = Controls and MetaIndex(Controls)
+
+    if not Index then
+        return false
+    end
+
+    pcall(function()
+        if rawget(Controls, "controlsEnabled") == false then
+            rawget(Index, "Enable")(Controls, true)
+        end
+    end)
+
+    pcall(function()
+        local Module, Success = rawget(Index, "SelectTouchModule")(Controls)
+
+        if Module and Success then
+            rawget(Index, "SwitchToController")(Controls, Module)
+        end
+    end)
+
+    pcall(function()
+        local TouchGui = rawget(Controls, "touchGui") or TouchGuard.FindTouchGui()
+        TouchGui.Enabled = true
+    end)
+
+    pcall(function()
+        rawget(Index, "UpdateActiveControlModuleEnabled")(Controls)
+    end)
+
+    task.wait(0.1)
+
+    return TouchGuard.ControlsShown() == true
+end
+
+-- One pass over everything the menu may have left behind. Returns
+-- what it changed.
+function TouchGuard.Repair(Baseline)
+    local Fixed = {}
+
+    if GuiService.MenuIsOpen then
+        return Fixed
+    end
+
+    -- SettingsHub forces the cursor on while it is open.
+    TouchGuard.Restore(UserInputService, "OverrideMouseIconBehavior", Baseline.Cursor, Fixed, "cursor")
+    TouchGuard.Restore(UserInputService, "ModalEnabled", Baseline.Modal, Fixed, "modal")
+    TouchGuard.Restore(GuiService, "TouchControlsEnabled", Baseline.Enabled, Fixed, "touch flag")
+
+    if GamepadService
+        and Baseline.GamepadCursor == false
+        and TouchGuard.Read(GamepadService, "GamepadCursorEnabled") == true
+        and pcall(function()
+            GamepadService:DisableGamepadCursor()
+        end)
+    then
+        table.insert(Fixed, "gamepad cursor")
+    end
+
+    -- SettingsHub's "stop the character" binding, in case its close
+    -- never finished. Nothing happens when it is not bound.
+    if ContextActionService then
+        pcall(function()
+            ContextActionService:UnbindCoreAction("RbxSettingsHubStopCharacter")
+        end)
+    end
+
+    if not TouchGuard.InTouchMode() then
+        RestoreTouchInput()
+        task.wait(0.05)
+        table.insert(Fixed, TouchGuard.InTouchMode() and "touch mode" or "touch mode failed")
+    end
+
+    if Baseline.Shown and TouchGuard.ControlsShown() == false then
+        if TouchGuard.RefreshControls() then
+            table.insert(Fixed, "controls refreshed")
+        elseif TouchGuard.ForceControls() then
+            table.insert(Fixed, "controls forced")
+        end
+    end
+
+    return Fixed
+end
+
+function TouchGuard.Describe()
+    local Shown = TouchGuard.ControlsShown()
+    local Controls = Native.Controls
+    local Module = "not found"
+
+    if Controls then
+        Module = rawget(Controls, "controlsEnabled") == false and "disabled" or "found"
+    end
+
+    return string.format(
+        "input %s | flag %s | cursor %s | gui %s | module %s | menu %s",
+        TouchGuard.Short(TouchGuard.Read(UserInputService, "PreferredInput") or UserInputService:GetLastInputType()),
+        TouchGuard.Short(TouchGuard.Read(GuiService, "TouchControlsEnabled")),
+        TouchGuard.Short(TouchGuard.Read(UserInputService, "OverrideMouseIconBehavior")),
+        Shown == nil and "none" or (Shown and "shown" or "hidden"),
+        Module,
+        State.MenuPath or "?"
+    )
+end
+
+-- Phones rarely show the executor console, so what was repaired
+-- (or what is still wrong) goes into a notification.
+function TouchGuard.Report(Fixed, Baseline)
+    local StillHidden = Baseline.Shown == true and TouchGuard.ControlsShown() == false
+
+    TouchGuard.Lost = StillHidden
+
+    if (#Fixed == 0 and not StillHidden) or TouchGuard.Reports >= 3 then
+        return
+    end
+
+    TouchGuard.Reports += 1
+
+    local Text = StillHidden and "Touch controls still hidden" or "Repaired after the menu closed"
+
+    if #Fixed > 0 then
+        Text ..= " (" .. table.concat(Fixed, ", ") .. ")"
+    end
+
+    Text ..= "\n" .. TouchGuard.Describe()
+
+    if Config.Verbose then
+        print("[OLD CHROME] " .. Text)
+    end
+
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title = "Old Chrome 2024 (" .. BUILD .. ")",
+            Text = Text,
+            Duration = 8,
+        })
+    end)
+end
+
+-- Runs whenever the menu closes: once after the close animation,
+-- then again for anything that changes a little later.
+function TouchGuard.OnMenuClosed()
+    local Baseline = TouchGuard.Baseline
+
+    if not Baseline or GuiService.MenuIsOpen then
+        return
+    end
+
+    TouchGuard.Generation += 1
+    local Generation = TouchGuard.Generation
+
+    task.spawn(function()
+        local Fixed = {}
+
+        for _, Delay in ipairs({ 0.4, 0.6, 1.5 }) do
+            task.wait(Delay)
+
+            if not Alive or Generation ~= TouchGuard.Generation or GuiService.MenuIsOpen then
+                return
+            end
+
+            for _, Name in ipairs(TouchGuard.Repair(Baseline)) do
+                if not table.find(Fixed, Name) then
+                    table.insert(Fixed, Name)
+                end
+            end
+        end
+
+        TouchGuard.Baseline = nil
+        TouchGuard.Report(Fixed, Baseline)
+    end)
+end
+
+function TouchGuard.Notify(Text)
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title = "Old Chrome 2024 (" .. BUILD .. ")",
+            Text = Text,
+            Duration = 8,
+        })
+    end)
+end
+
+--============================================================
+-- CURSOR GUARD
+--============================================================
+-- A phone or tablet never needs a cursor, yet SettingsHub forces one
+-- on (ForceShow) while the Escape menu is open, and any stray mouse
+-- event shows one. It is kept hidden; whatever the game or the
+-- CoreScripts last asked for is put back on unload.
+--============================================================
+
+local CursorGuard = {
+    Active = false,
+    Wanted = nil,
+}
+
+function CursorGuard.Apply()
+    if not CursorGuard.Active or not Alive then
+        return
+    end
+
+    local Current = TouchGuard.Read(UserInputService, "OverrideMouseIconBehavior")
+
+    if Current == nil or Current == Enum.OverrideMouseIconBehavior.ForceHide then
+        return
+    end
+
+    CursorGuard.Wanted = Current
+
+    pcall(function()
+        UserInputService.OverrideMouseIconBehavior = Enum.OverrideMouseIconBehavior.ForceHide
+    end)
+end
+
+function CursorGuard.Release()
+    if not CursorGuard.Active then
+        return
+    end
+
+    CursorGuard.Active = false
+
+    pcall(function()
+        UserInputService.OverrideMouseIconBehavior = CursorGuard.Wanted
+            or Enum.OverrideMouseIconBehavior.None
+    end)
+end
+
+if Config.HideCursorOnTouch and TouchGuard.IsTouchDevice() then
+    CursorGuard.Active = true
+    CursorGuard.Wanted = TouchGuard.Read(UserInputService, "OverrideMouseIconBehavior")
+    CursorGuard.Apply()
+
+    pcall(function()
+        Connect(UserInputService:GetPropertyChangedSignal("OverrideMouseIconBehavior"), CursorGuard.Apply)
+    end)
+
+    local Cleanup = LocalEnv.__OldChrome2024Cleanup
+
+    LocalEnv.__OldChrome2024Cleanup = function()
+        CursorGuard.Release()
+        Cleanup()
+    end
+end
+
+--============================================================
+-- TOUCH MODE KEEPER
+--============================================================
+-- One keyboard or mouse event (a fake click from another script, a
+-- key the executor sent) switches a phone to keyboard-and-mouse mode:
+-- the GUI shows keyboard hints and the thumbstick hides. A phone is
+-- never really used that way, so touch mode is put straight back with
+-- one synthetic tap on the sink. Never while a TextBox has focus: the
+-- on-screen keyboard counts as a keyboard, and the tap would close it.
+--============================================================
+
+local TouchKeeper = {
+    Last = -1,
+}
+
+function TouchKeeper.Check()
+    if not Alive
+        or not Config.KeepTouchMode
+        or not TouchGuard.IsTouchDevice()
+        or IsTextBoxFocused()
+        or TouchGuard.InTouchMode()
+    then
+        return
+    end
+
+    local Preferred = TouchGuard.Read(UserInputService, "PreferredInput")
+
+    if Preferred ~= nil then
+        -- A gamepad is a real choice; only keyboard-and-mouse is undone.
+        if Preferred ~= Enum.PreferredInput.KeyboardAndMouse then
+            return
+        end
+    else
+        local Last = UserInputService:GetLastInputType()
+
+        if Last ~= Enum.UserInputType.Keyboard
+            and not string.find(Last.Name, "Mouse", 1, true)
+        then
+            return
+        end
+    end
+
+    if os.clock() - TouchKeeper.Last < 0.3 then
+        return
+    end
+
+    TouchKeeper.Last = os.clock()
+    task.spawn(RestoreTouchInput)
+end
+
+pcall(function()
+    Connect(UserInputService:GetPropertyChangedSignal("PreferredInput"), TouchKeeper.Check)
+end)
+
+Connect(UserInputService.LastInputTypeChanged, TouchKeeper.Check)
+
+Connect(UserInputService.TextBoxFocusReleased, function()
+    task.delay(0.1, TouchKeeper.Check)
+end)
+
+--============================================================
 -- NATIVE ACTIONS
 --============================================================
 
--- ChromeUtils.dismissRobloxMenuAndRun: opening a panel first
--- closes the Escape menu.
-local function DismissMenu()
-    if not GuiService.MenuIsOpen then
-        return
+local function WaitForMenu(Open, Timeout)
+    local Deadline = os.clock() + Timeout
+
+    while Alive and GuiService.MenuIsOpen ~= Open and os.clock() < Deadline do
+        task.wait()
+    end
+
+    return GuiService.MenuIsOpen == Open
+end
+
+-- Opens or closes the Escape menu, preferring paths that do not
+-- send key events. Yields while it waits for the menu.
+local function SetEscapeMenuOpen(Open)
+    if GuiService.MenuIsOpen == Open then
+        return true
+    end
+
+    -- Taken before anything below can hide the touch controls.
+    if Open and not TouchGuard.Baseline then
+        TouchGuard.Baseline = TouchGuard.Snapshot()
     end
 
     local Settings = Native.Settings
 
-    if not (Settings and pcall(function()
-        Settings:SetVisibility(false)
-    end)) then
-        SendKey(Enum.KeyCode.Escape)
+    if Settings
+        and pcall(function()
+            Settings:SetVisibility(Open)
+        end)
+        and WaitForMenu(Open, 0.5)
+    then
+        State.MenuPath = "SettingsHub"
+        return true
     end
 
-    local Deadline = os.clock() + 1
+    -- Phones and tablets: a synthetic touch on Roblox's own button
+    -- (given up after it missed twice).
+    if TouchGuard.IsTouchDevice()
+        and (State.TapMisses or 0) < 2
+        and TapNativeMenuButton()
+    then
+        if WaitForMenu(Open, 1) then
+            State.MenuPath = "tap"
+            return true
+        end
 
-    while GuiService.MenuIsOpen and os.clock() < Deadline do
-        task.wait()
+        State.TapMisses = (State.TapMisses or 0) + 1
+
+        if State.TapMisses == 1 then
+            TouchGuard.Notify("The tap on Roblox's own menu button missed; using a fallback.")
+        end
+    end
+
+    -- A slow toggle from the step above must not be toggled back.
+    if GuiService.MenuIsOpen == Open then
+        return true
+    end
+
+    local Button = FindNativeMenuButton()
+
+    if Button then
+        -- Never both: a slow handler would be toggled twice.
+        if CallHandlers(Button.Activated) then
+            if WaitForMenu(Open, 0.5) then
+                State.MenuPath = "handler"
+                return true
+            end
+        elseif SimulateSignal(Button.Activated) and WaitForMenu(Open, 0.5) then
+            State.MenuPath = "firesignal"
+            return true
+        end
+    end
+
+    if GuiService.MenuIsOpen == Open then
+        return true
+    end
+
+    State.MenuPath = "Escape key"
+
+    return SendKey(Enum.KeyCode.Escape, true) and WaitForMenu(Open, 1)
+end
+
+-- ChromeUtils.dismissRobloxMenuAndRun: opening a panel first
+-- closes the Escape menu.
+local function DismissMenu()
+    if GuiService.MenuIsOpen then
+        SetEscapeMenuOpen(false)
     end
 end
 
@@ -1317,6 +2316,14 @@ Steps.backpack = {
 
     function()
         return ActivateChromeIntegration("backpack")
+    end,
+
+    function(Desired)
+        if Desired then
+            DismissMenu()
+        end
+
+        return CallNativeKeyHandler("BackpackScript", Enum.KeyCode.Backquote)
     end,
 
     function(Desired)
@@ -1490,9 +2497,7 @@ local function ActivateReport()
         State.Active.report = false
         UpdateIconStates()
 
-        if GuiService.MenuIsOpen then
-            SendKey(Enum.KeyCode.Escape)
-        end
+        task.spawn(SetEscapeMenuOpen, false)
 
         return
     end
@@ -1501,9 +2506,7 @@ local function ActivateReport()
     UpdateIconStates()
 
     task.spawn(function()
-        if not GuiService.MenuIsOpen then
-            SendKey(Enum.KeyCode.Escape)
-        end
+        SetEscapeMenuOpen(true)
 
         local Deadline = os.clock() + 5
         local Button
@@ -1514,7 +2517,11 @@ local function ActivateReport()
         until Button or os.clock() > Deadline or not Alive
 
         if Button then
-            if not FireSignal(Button.Activated) then
+            -- Phones: tap the tab for real, so touch mode is kept, once
+            -- a tap has just proved to reach Roblox's buttons.
+            local Tapped = State.MenuPath == "tap" and TapButton(Button, false)
+
+            if not Tapped and not FireSignal(Button.Activated) then
                 FireSignal(Button.MouseButton1Click)
             end
         else
@@ -1528,15 +2535,16 @@ end
 --============================================================
 
 local function ToggleEscapeMenu()
-    local Settings = Native.Settings
-
-    if Settings and pcall(function()
-        Settings:ToggleVisibility()
-    end) then
+    if State.MenuBusy then
         return
     end
 
-    SendKey(Enum.KeyCode.Escape)
+    State.MenuBusy = true
+
+    task.spawn(function()
+        pcall(SetEscapeMenuOpen, not GuiService.MenuIsOpen)
+        State.MenuBusy = false
+    end)
 end
 
 local function ActivateIntegration(Id)
@@ -2549,6 +3557,11 @@ end
 
 if MenuIconBackground and MenuIconBackground:IsA("GuiButton") then
     OnActivated(MenuIconBackground, function()
+        -- The synthetic tap is meant for the native button below.
+        if NativeBarHold.Open then
+            return
+        end
+
         CloseSubmenu()
         ToggleEscapeMenu()
     end)
@@ -2576,6 +3589,10 @@ local function OnMenuStateChanged()
     -- Without SettingsHub the Report state ends with the menu.
     if not GuiService.MenuIsOpen and not Native.Settings then
         State.Active.report = false
+    end
+
+    if not GuiService.MenuIsOpen then
+        TouchGuard.OnMenuClosed()
     end
 
     SyncNativeState()
@@ -2944,6 +3961,35 @@ task.spawn(function()
         Native.Chrome and "found" or "fallback"
     ))
 
+    -- Phones rarely show the executor console, so report the build
+    -- and how the Roblox button will reach the Escape menu on screen.
+    local MenuPath = "Escape key + touch restore"
+
+    if Native.Settings then
+        MenuPath = "SettingsHub"
+    elseif FindNativeMenuButton() and VirtualInputManager and TouchGuard.IsTouchDevice() then
+        MenuPath = "tap on native button"
+    elseif FindNativeMenuButton()
+        and (type(getconnections) == "function" or type(firesignal) == "function")
+    then
+        MenuPath = "native button"
+    end
+
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title = "Old Chrome 2024 (" .. BUILD .. ")",
+            Text = string.format(
+                "Menu: %s (handlers %s)\ngetgc %s, getconnections %s, firesignal %s",
+                MenuPath,
+                DescribeMenuHandlers(),
+                Scanned and "yes" or "no",
+                type(getconnections) == "function" and "yes" or "no",
+                type(firesignal) == "function" and "yes" or "no"
+            ),
+            Duration = 10,
+        })
+    end)
+
     if Config.ClosePanelsOnStart then
         ClosePanelsOnStart()
     end
@@ -2955,7 +4001,7 @@ end)
 
 print("")
 print("============================================================")
-print("OLD CHROME 2024 READY")
+print("OLD CHROME 2024 READY  (build: " .. BUILD .. ")")
 print("============================================================")
 print("Original TopBarApp disabled:", #NativeTopBars)
 print("RobloxGui:", RobloxGui and "LEFT ENABLED" or "NOT FOUND")
