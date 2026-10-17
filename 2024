@@ -771,6 +771,15 @@ end
 -- real touch. Native hotkeys are therefore only ever emulated for a
 -- player who is actually on keyboard and mouse.
 local function IsKeyboardAndMouse()
+    -- Phones and tablets never count, whatever PreferredInput currently
+    -- says: it may already have been flipped by an earlier fake key or
+    -- by an executor overlay.
+    if IsMobileDevice()
+        or (UserInputService.TouchEnabled and not UserInputService.MouseEnabled)
+    then
+        return false
+    end
+
     local Ok, Result = pcall(function()
         return UserInputService.PreferredInput == Enum.PreferredInput.KeyboardAndMouse
     end)
@@ -973,25 +982,56 @@ end
 -- NATIVE COREUI ACCESS
 --============================================================
 
+-- Runs a signal's connected handlers. Calling each handler directly is
+-- preferred: a plain Lua call cannot generate input, while how an
+-- executor implements firesignal / :Fire() is unknown.
 local function FireSignal(Signal)
-    if type(firesignal) == "function" then
-        if pcall(firesignal, Signal) then
+    local List = nil
+
+    if type(getconnections) == "function" then
+        local Ok, Result = pcall(getconnections, Signal)
+
+        if Ok and type(Result) == "table" then
+            List = Result
+        end
+    end
+
+    if List then
+        local Called = false
+
+        for _, Item in ipairs(List) do
+            local Handler = nil
+
+            pcall(function()
+                Handler = Item.Function
+            end)
+
+            if type(Handler) == "function" then
+                Called = true
+
+                task.spawn(function()
+                    pcall(Handler)
+                end)
+            end
+        end
+
+        if Called then
             return true
         end
     end
 
-    if type(getconnections) == "function" then
-        local Ok, List = pcall(getconnections, Signal)
+    if type(firesignal) == "function" and pcall(firesignal, Signal) then
+        return true
+    end
 
-        if Ok and type(List) == "table" and #List > 0 then
-            for _, Item in ipairs(List) do
-                pcall(function()
-                    Item:Fire()
-                end)
-            end
-
-            return true
+    if List and #List > 0 then
+        for _, Item in ipairs(List) do
+            pcall(function()
+                Item:Fire()
+            end)
         end
+
+        return true
     end
 
     return false
@@ -3072,7 +3112,7 @@ end)
 
 print("")
 print("============================================================")
-print("OLD CHROME 2024 READY")
+print("OLD CHROME 2024 READY  (build: touch-safe 3)")
 print("============================================================")
 print("Original TopBarApp disabled:", #NativeTopBars)
 print("RobloxGui:", RobloxGui and "LEFT ENABLED" or "NOT FOUND")
