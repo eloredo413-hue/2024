@@ -32,11 +32,14 @@
 --   Chat, PlayerList, Backpack, Emotes and the Escape menu are the
 --   real Roblox ones. Buttons call the same native objects the 2024
 --   integrations called (PlayerList controller, BackpackScript,
---   SettingsHub) when the executor provides getgc, and otherwise
---   fall back to the native hotkeys (Tab / Backquote / Escape).
+--   SettingsHub) when the executor provides getgc. Otherwise they use
+--   the disabled native top bar's own buttons, or call the native key
+--   handler directly.
 --
---   Phones need the native path: the PlayerList ignores Tab on
---   small touch screens, so a synthetic Tab can never open it there.
+--   Synthetic key presses (Tab / Backquote / Escape) are only sent to
+--   keyboard-and-mouse players. On touch, one fake key press switches
+--   Roblox to keyboard mode: a cursor appears and the thumbstick and
+--   jump button disappear until the next touch.
 --
 --   Icon states are read back from the native UI (event driven,
 --   with a light 4 Hz poll as a safety net), so the native hotkeys
@@ -761,12 +764,32 @@ local function ComputeSlotLimit()
     return 2
 end
 
-local function MouseHoverAllowed()
-    if not UserInputService.MouseEnabled then
-        return false
+-- The PlayerModule (ControlModule:UpdateTouchGuiVisibility) only
+-- shows the thumbstick and jump button while PreferredInput is Touch.
+-- One synthetic key event switches PreferredInput to KeyboardAndMouse:
+-- the touch controls disappear and a mouse cursor shows until the next
+-- real touch. Native hotkeys are therefore only ever emulated for a
+-- player who is actually on keyboard and mouse.
+local function IsKeyboardAndMouse()
+    local Ok, Result = pcall(function()
+        return UserInputService.PreferredInput == Enum.PreferredInput.KeyboardAndMouse
+    end)
+
+    if Ok then
+        return Result
     end
 
-    return UserInputService:GetLastInputType() ~= Enum.UserInputType.Touch
+    -- Clients without PreferredInput.
+    if not UserInputService.TouchEnabled then
+        return true
+    end
+
+    return UserInputService.KeyboardEnabled
+        and UserInputService:GetLastInputType() ~= Enum.UserInputType.Touch
+end
+
+local function MouseHoverAllowed()
+    return UserInputService.MouseEnabled and IsKeyboardAndMouse()
 end
 
 --============================================================
@@ -974,8 +997,15 @@ local function FireSignal(Signal)
     return false
 end
 
-local function SendKey(KeyCode)
+-- AllowOnTouch is only used to open the Escape menu as a last resort:
+-- the menu covers the touch controls, and the next tap inside it
+-- switches input back to touch.
+local function SendKey(KeyCode, AllowOnTouch)
     if not VirtualInputManager then
+        return false
+    end
+
+    if not AllowOnTouch and not IsKeyboardAndMouse() then
         return false
     end
 
@@ -1088,6 +1118,76 @@ local function FireNativeHitArea(Id)
 
         if Button and Button:IsA("GuiButton") then
             return FireSignal(Button.Activated)
+        end
+    end
+
+    return false
+end
+
+-- The disabled native top bar's own Roblox button
+-- (MenuIconHolder / MenuIcon > MenuIconTriggerPoint). Its handler
+-- is SettingsHub:ToggleVisibility, so firing it needs no key event.
+local function FireNativeMenuButton()
+    for _, Object in ipairs(NativeTopBars) do
+        for _, Name in ipairs({ "MenuIconHolder", "MenuIcon", "MenuIconTriggerPoint" }) do
+            local Holder = Object:FindFirstChild(Name, true)
+            local Button = Holder
+                and (Holder:IsA("GuiButton") and Holder
+                    or Holder:FindFirstChildWhichIsA("GuiButton", true))
+
+            if Button then
+                return FireSignal(Button.Activated)
+            end
+        end
+    end
+
+    return false
+end
+
+-- Calls a CoreScript's own UserInputService.InputBegan handler with a
+-- key, instead of sending a real key event. Nothing reaches the input
+-- system, so PreferredInput (and the touch controls) stay as they are.
+local function CallNativeKeyHandler(SourceName, KeyCode)
+    if type(getconnections) ~= "function" then
+        return false
+    end
+
+    local Ok, List = pcall(getconnections, UserInputService.InputBegan)
+
+    if not Ok or type(List) ~= "table" then
+        return false
+    end
+
+    for _, Item in ipairs(List) do
+        local Handler = nil
+
+        pcall(function()
+            Handler = Item.Function
+        end)
+
+        local SourceOk, Source = false, nil
+
+        if type(Handler) == "function" then
+            SourceOk, Source = pcall(debug.info, Handler, "s")
+        end
+
+        if SourceOk
+            and type(Source) == "string"
+            and string.find(Source, SourceName, 1, true)
+        then
+            local Input = {
+                UserInputType = Enum.UserInputType.Keyboard,
+                UserInputState = Enum.UserInputState.Begin,
+                KeyCode = KeyCode,
+            }
+
+            -- isProcessed = true: only the hotkey runs, not the
+            -- "a tap closes the inventory" branch.
+            task.spawn(function()
+                pcall(Handler, Input, true)
+            end)
+
+            return true
         end
     end
 
@@ -1217,25 +1317,46 @@ end
 -- NATIVE ACTIONS
 --============================================================
 
--- ChromeUtils.dismissRobloxMenuAndRun: opening a panel first
--- closes the Escape menu.
-local function DismissMenu()
-    if not GuiService.MenuIsOpen then
-        return
+local function WaitForMenu(Open, Timeout)
+    local Deadline = os.clock() + Timeout
+
+    while Alive and GuiService.MenuIsOpen ~= Open and os.clock() < Deadline do
+        task.wait()
+    end
+
+    return GuiService.MenuIsOpen == Open
+end
+
+-- Opens or closes the Escape menu, preferring paths that do not
+-- send key events. Yields while it waits for the menu.
+local function SetEscapeMenuOpen(Open)
+    if GuiService.MenuIsOpen == Open then
+        return true
     end
 
     local Settings = Native.Settings
 
-    if not (Settings and pcall(function()
-        Settings:SetVisibility(false)
-    end)) then
-        SendKey(Enum.KeyCode.Escape)
+    if Settings
+        and pcall(function()
+            Settings:SetVisibility(Open)
+        end)
+        and WaitForMenu(Open, 0.5)
+    then
+        return true
     end
 
-    local Deadline = os.clock() + 1
+    if FireNativeMenuButton() and WaitForMenu(Open, 0.5) then
+        return true
+    end
 
-    while GuiService.MenuIsOpen and os.clock() < Deadline do
-        task.wait()
+    return SendKey(Enum.KeyCode.Escape, Open) and WaitForMenu(Open, 1)
+end
+
+-- ChromeUtils.dismissRobloxMenuAndRun: opening a panel first
+-- closes the Escape menu.
+local function DismissMenu()
+    if GuiService.MenuIsOpen then
+        SetEscapeMenuOpen(false)
     end
 end
 
@@ -1317,6 +1438,14 @@ Steps.backpack = {
 
     function()
         return ActivateChromeIntegration("backpack")
+    end,
+
+    function(Desired)
+        if Desired then
+            DismissMenu()
+        end
+
+        return CallNativeKeyHandler("BackpackScript", Enum.KeyCode.Backquote)
     end,
 
     function(Desired)
@@ -1490,9 +1619,7 @@ local function ActivateReport()
         State.Active.report = false
         UpdateIconStates()
 
-        if GuiService.MenuIsOpen then
-            SendKey(Enum.KeyCode.Escape)
-        end
+        task.spawn(SetEscapeMenuOpen, false)
 
         return
     end
@@ -1501,9 +1628,7 @@ local function ActivateReport()
     UpdateIconStates()
 
     task.spawn(function()
-        if not GuiService.MenuIsOpen then
-            SendKey(Enum.KeyCode.Escape)
-        end
+        SetEscapeMenuOpen(true)
 
         local Deadline = os.clock() + 5
         local Button
@@ -1528,15 +1653,7 @@ end
 --============================================================
 
 local function ToggleEscapeMenu()
-    local Settings = Native.Settings
-
-    if Settings and pcall(function()
-        Settings:ToggleVisibility()
-    end) then
-        return
-    end
-
-    SendKey(Enum.KeyCode.Escape)
+    task.spawn(SetEscapeMenuOpen, not GuiService.MenuIsOpen)
 end
 
 local function ActivateIntegration(Id)
