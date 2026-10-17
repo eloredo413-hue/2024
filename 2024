@@ -46,8 +46,15 @@
 --   The Roblox button opens the menu with a synthetic touch on
 --   Roblox's own (disabled) button, so the CoreScript handles it like
 --   a real tap and the device stays in touch mode. The cursor is kept
---   hidden, and touch mode is restored at once if any stray keyboard
---   or mouse event switches the game out of it.
+--   hidden. Game scripts (the thumbstick / jump button, game UI) always
+--   read PreferredInput as Touch, so a stray keyboard or mouse event
+--   never switches them to the PC layout, and Roblox's own UI is put
+--   back in touch mode once no finger is on the screen. Nothing ever
+--   covers the screen while a finger is down (a held jump button would
+--   stay stuck).
+--
+--   Nothing pops up: status goes to the console and to
+--   getgenv().OldChrome2024Status.
 --
 --   Icon states are read back from the native UI (event driven,
 --   with a light 4 Hz poll as a safety net), so the native hotkeys
@@ -68,8 +75,8 @@
 --
 -- Settings can be overridden before executing:
 --   getgenv().OldChrome2024Config = { ClosePanelsOnStart = false }
---   (HideCursorOnTouch / KeepTouchMode = false for a tablet used
---   with a real mouse or keyboard)
+--   (HideCursorOnTouch / KeepTouchMode / SpoofTouchInput = false for
+--   a tablet used with a real mouse or keyboard)
 --
 --============================================================
 
@@ -131,6 +138,12 @@ local Config = {
     HideCursorOnTouch = true,
     KeepTouchMode = true,
 
+    -- Phones: game scripts (the PlayerModule's thumbstick and jump
+    -- button, game UI) always read UserInputService.PreferredInput as
+    -- Touch, so a stray keyboard/mouse event never switches them to
+    -- the PC layout. Needs hookmetamethod; needs KeepTouchMode.
+    SpoofTouchInput = true,
+
     Verbose = false,
 }
 
@@ -140,8 +153,27 @@ if type(LocalEnv.OldChrome2024Config) == "table" then
     end
 end
 
--- Shown in the startup notification and print, to tell copies apart.
-local BUILD = "touch-safe 7"
+-- Printed at startup, to tell copies apart.
+local BUILD = "touch-safe 8"
+
+-- Nothing pops up on screen. What the script did is printed to the
+-- console and kept in getgenv().OldChrome2024Status.
+local Status = {
+    Build = BUILD,
+    Messages = {},
+}
+
+LocalEnv.OldChrome2024Status = Status
+
+local function Note(Text)
+    table.insert(Status.Messages, Text)
+
+    if #Status.Messages > 20 then
+        table.remove(Status.Messages, 1)
+    end
+
+    print("[OLD CHROME] " .. Text)
+end
 
 local function Log(...)
     if Config.Verbose then
@@ -1111,6 +1143,48 @@ TouchSink.Parent = TopBarApp
 
 local TOUCH_SINK_ID = 9137
 
+-- Fingers on the screen right now. Nothing may cover the screen while
+-- one is down: a held jump button whose release lands on a cover never
+-- hears it, and stays pressed.
+local ActiveTouches = {}
+
+Connect(UserInputService.TouchStarted, function(Input)
+    ActiveTouches[Input] = true
+end)
+
+Connect(UserInputService.TouchEnded, function(Input)
+    ActiveTouches[Input] = nil
+end)
+
+local function FingersDown()
+    for Input in pairs(ActiveTouches) do
+        local Ok, InputState = pcall(function()
+            return Input.UserInputState
+        end)
+
+        -- A touch whose end was never reported is not held any more.
+        if not Ok
+            or InputState == Enum.UserInputState.End
+            or InputState == Enum.UserInputState.Cancel
+        then
+            ActiveTouches[Input] = nil
+        end
+    end
+
+    return next(ActiveTouches) ~= nil
+end
+
+-- Waits (up to Timeout) for every finger to leave the screen.
+local function WaitForFingersUp(Timeout)
+    local Deadline = os.clock() + Timeout
+
+    while Alive and FingersDown() and os.clock() < Deadline do
+        task.wait()
+    end
+
+    return not FingersDown()
+end
+
 -- A synthetic key switches a touch device to keyboard-and-mouse mode:
 -- a cursor appears and the thumbstick / jump button hide. One
 -- synthetic tap on the sink switches it straight back to touch.
@@ -1119,6 +1193,7 @@ local function RestoreTouchInput()
         or not UserInputService.TouchEnabled
         or State.SyntheticTouch
         or State.NoTouchEvents
+        or FingersDown()
     then
         return
     end
@@ -1427,14 +1502,18 @@ local function TapButton(Button, EnableGui)
     local NativeGui = Button and Button:FindFirstAncestorWhichIsA("LayerCollector")
     local Deadline = os.clock() + 0.25
 
-    -- A restore tap may be finishing.
-    while State.SyntheticTouch and os.clock() < Deadline do
+    -- A restore tap may be finishing, and the finger that tapped our
+    -- button may take a frame to be reported as lifted.
+    while (State.SyntheticTouch or FingersDown()) and os.clock() < Deadline do
         task.wait()
     end
 
+    -- Another finger is holding something (thumbstick, jump button):
+    -- covering the screen now could leave it stuck.
     if not (VirtualInputManager and NativeGui and MenuIconBackground)
         or State.SyntheticTouch
         or State.NoTouchEvents
+        or FingersDown()
     then
         return false
     end
@@ -1705,7 +1784,6 @@ end
 local TouchGuard = {
     Baseline = nil,
     Generation = 0,
-    Reports = 0,
     -- The controls were shown before an earlier menu and never came
     -- back; the next menu still counts them as shown.
     Lost = false,
@@ -1945,18 +2023,16 @@ function TouchGuard.Describe()
     )
 end
 
--- Phones rarely show the executor console, so what was repaired
--- (or what is still wrong) goes into a notification.
+-- What was repaired (or what is still wrong) goes to the console and
+-- getgenv().OldChrome2024Status.
 function TouchGuard.Report(Fixed, Baseline)
     local StillHidden = Baseline.Shown == true and TouchGuard.ControlsShown() == false
 
     TouchGuard.Lost = StillHidden
 
-    if (#Fixed == 0 and not StillHidden) or TouchGuard.Reports >= 3 then
+    if #Fixed == 0 and not StillHidden then
         return
     end
-
-    TouchGuard.Reports += 1
 
     local Text = StillHidden and "Touch controls still hidden" or "Repaired after the menu closed"
 
@@ -1964,19 +2040,7 @@ function TouchGuard.Report(Fixed, Baseline)
         Text ..= " (" .. table.concat(Fixed, ", ") .. ")"
     end
 
-    Text ..= "\n" .. TouchGuard.Describe()
-
-    if Config.Verbose then
-        print("[OLD CHROME] " .. Text)
-    end
-
-    pcall(function()
-        StarterGui:SetCore("SendNotification", {
-            Title = "Old Chrome 2024 (" .. BUILD .. ")",
-            Text = Text,
-            Duration = 8,
-        })
-    end)
+    Note(Text .. " | " .. TouchGuard.Describe())
 end
 
 -- Runs whenever the menu closes: once after the close animation,
@@ -1997,6 +2061,10 @@ function TouchGuard.OnMenuClosed()
         for _, Delay in ipairs({ 0.4, 0.6, 1.5 }) do
             task.wait(Delay)
 
+            -- Never while a finger is down: refreshing the controls
+            -- under a held jump button would leave it stuck.
+            WaitForFingersUp(8)
+
             if not Alive or Generation ~= TouchGuard.Generation or GuiService.MenuIsOpen then
                 return
             end
@@ -2010,16 +2078,6 @@ function TouchGuard.OnMenuClosed()
 
         TouchGuard.Baseline = nil
         TouchGuard.Report(Fixed, Baseline)
-    end)
-end
-
-function TouchGuard.Notify(Text)
-    pcall(function()
-        StarterGui:SetCore("SendNotification", {
-            Title = "Old Chrome 2024 (" .. BUILD .. ")",
-            Text = Text,
-            Duration = 8,
-        })
     end)
 end
 
@@ -2086,6 +2144,94 @@ if Config.HideCursorOnTouch and TouchGuard.IsTouchDevice() then
 end
 
 --============================================================
+-- TOUCH MODE FOR GAME SCRIPTS
+--============================================================
+-- Roblox switches a phone to keyboard-and-mouse mode after any
+-- keyboard or mouse event, real or not (another script's
+-- VirtualInputManager click, a key an executor sent). The PlayerModule
+-- then hides the thumbstick and jump button (a held jump button gets
+-- stuck) and game UI switches to its PC layout. On a phone the player
+-- is always on touch, so scripts reading
+-- UserInputService.PreferredInput are told Touch. This script
+-- (checkcaller) still reads the real value. The hook is installed once
+-- per session; later copies and unload only switch it on and off.
+--============================================================
+
+local TouchSpoof = LocalEnv.__OldChrome2024TouchSpoof
+
+if type(TouchSpoof) ~= "table" then
+    TouchSpoof = {
+        Enabled = false,
+        Installed = false,
+    }
+
+    LocalEnv.__OldChrome2024TouchSpoof = TouchSpoof
+end
+
+TouchSpoof.Enabled = false
+
+do
+    local TouchOk, Touch = pcall(function()
+        return Enum.PreferredInput.Touch
+    end)
+
+    if Config.SpoofTouchInput
+        and Config.KeepTouchMode
+        and IsMobileDevice()
+        and TouchOk
+        and TouchGuard.Read(UserInputService, "PreferredInput") ~= nil
+        and type(hookmetamethod) == "function"
+        and type(checkcaller) == "function"
+    then
+        if not TouchSpoof.Installed then
+            local Wrap = type(newcclosure) == "function" and newcclosure
+                or function(Function)
+                    return Function
+                end
+            local Service = UserInputService
+            local OldIndex = nil
+
+            pcall(function()
+                OldIndex = hookmetamethod(game, "__index", Wrap(function(Self, Key)
+                    if Key == "PreferredInput"
+                        and TouchSpoof.Enabled
+                        and Self == Service
+                        and not checkcaller()
+                    then
+                        return Touch
+                    end
+
+                    return OldIndex(Self, Key)
+                end))
+            end)
+
+            TouchSpoof.Installed = type(OldIndex) == "function"
+        end
+
+        TouchSpoof.Enabled = TouchSpoof.Installed
+    end
+
+    local Cleanup = LocalEnv.__OldChrome2024Cleanup
+
+    LocalEnv.__OldChrome2024Cleanup = function()
+        TouchSpoof.Enabled = false
+        Cleanup()
+    end
+
+    Status.TouchSpoof = TouchSpoof.Enabled
+
+    -- Controls the PlayerModule already hid before this ran: make it
+    -- look again, now that it reads Touch.
+    if TouchSpoof.Enabled and not TouchGuard.InTouchMode() then
+        task.defer(function()
+            if WaitForFingersUp(5) and TouchGuard.ControlsShown() == false then
+                TouchGuard.RefreshControls()
+            end
+        end)
+    end
+end
+
+--============================================================
 -- TOUCH MODE KEEPER
 --============================================================
 -- One keyboard or mouse event (a fake click from another script, a
@@ -2098,15 +2244,27 @@ end
 
 local TouchKeeper = {
     Last = -1,
+    Pending = false,
+    Failures = 0,
 }
 
 function TouchKeeper.Check()
+    TouchKeeper.Pending = false
+
     if not Alive
         or not Config.KeepTouchMode
         or not TouchGuard.IsTouchDevice()
+        or TouchKeeper.Failures >= 2
         or IsTextBoxFocused()
         or TouchGuard.InTouchMode()
     then
+        return
+    end
+
+    -- A finger on the screen: wait until it lifts (its own touch may
+    -- switch back by itself meanwhile).
+    if FingersDown() then
+        TouchKeeper.Pending = true
         return
     end
 
@@ -2132,8 +2290,25 @@ function TouchKeeper.Check()
     end
 
     TouchKeeper.Last = os.clock()
-    task.spawn(RestoreTouchInput)
+
+    task.spawn(function()
+        RestoreTouchInput()
+        task.wait(0.1)
+
+        -- A synthetic touch that does not bring touch mode back (the
+        -- executor's touch events count as something else) is never
+        -- tried again.
+        if not TouchGuard.InTouchMode() and not FingersDown() then
+            TouchKeeper.Failures += 1
+        end
+    end)
 end
+
+Connect(UserInputService.TouchEnded, function()
+    if TouchKeeper.Pending then
+        task.delay(0.05, TouchKeeper.Check)
+    end
+end)
 
 pcall(function()
     Connect(UserInputService:GetPropertyChangedSignal("PreferredInput"), TouchKeeper.Check)
@@ -2197,7 +2372,7 @@ local function SetEscapeMenuOpen(Open)
         State.TapMisses = (State.TapMisses or 0) + 1
 
         if State.TapMisses == 1 then
-            TouchGuard.Notify("The tap on Roblox's own menu button missed; using a fallback.")
+            Note("The tap on Roblox's own menu button missed; using a fallback.")
         end
     end
 
@@ -2543,6 +2718,7 @@ local function ToggleEscapeMenu()
 
     task.spawn(function()
         pcall(SetEscapeMenuOpen, not GuiService.MenuIsOpen)
+        Status.MenuPath = State.MenuPath
         State.MenuBusy = false
     end)
 end
@@ -3961,8 +4137,7 @@ task.spawn(function()
         Native.Chrome and "found" or "fallback"
     ))
 
-    -- Phones rarely show the executor console, so report the build
-    -- and how the Roblox button will reach the Escape menu on screen.
+    -- How the Roblox button will reach the Escape menu (console only).
     local MenuPath = "Escape key + touch restore"
 
     if Native.Settings then
@@ -3975,20 +4150,19 @@ task.spawn(function()
         MenuPath = "native button"
     end
 
-    pcall(function()
-        StarterGui:SetCore("SendNotification", {
-            Title = "Old Chrome 2024 (" .. BUILD .. ")",
-            Text = string.format(
-                "Menu: %s (handlers %s)\ngetgc %s, getconnections %s, firesignal %s",
-                MenuPath,
-                DescribeMenuHandlers(),
-                Scanned and "yes" or "no",
-                type(getconnections) == "function" and "yes" or "no",
-                type(firesignal) == "function" and "yes" or "no"
-            ),
-            Duration = 10,
-        })
-    end)
+    Status.PredictedMenuPath = MenuPath
+    Status.MenuHandlers = DescribeMenuHandlers()
+
+    Note(string.format(
+        "%s | menu: %s (handlers %s) | getgc %s, getconnections %s, firesignal %s, hookmetamethod %s",
+        BUILD,
+        MenuPath,
+        Status.MenuHandlers,
+        Scanned and "yes" or "no",
+        type(getconnections) == "function" and "yes" or "no",
+        type(firesignal) == "function" and "yes" or "no",
+        type(hookmetamethod) == "function" and "yes" or "no"
+    ))
 
     if Config.ClosePanelsOnStart then
         ClosePanelsOnStart()

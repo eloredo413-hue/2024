@@ -1,10 +1,10 @@
 -- [[ 2024 / 2023 / 2021 / 2019 / 2017 / 2013 MOBILE HOOKS + PLACEHOLDERS ]]
 -- Run AFTER the main Bloxy Paradox script.
 --
--- "2023 new" is now "2024": it loads the 2024 top bar (Old Chrome 2024)
--- in place of the 2023 GUI. The 2023 new GUI is not loaded any more, so
--- its chat icon (LegacyChatIcon), its fast flags and the rejoin it did
--- are gone with it.
+-- "2023 new" is now "2024": it loads the 2024 GUI (2024-gui.lua), which
+-- sets the 2023 new GUI's fast flags, rejoins like it did, and shows the
+-- 2024 top bar (Old Chrome 2024) instead of the 2023 one. The 2023 new
+-- GUI's chat icon (LegacyChatIcon) is not part of it.
 
 ------------------------------------------------------------
 -- PART 1: LOADSTRING HOOK
@@ -16,7 +16,7 @@ if not _ORIG_LS then
 end
 
 do
-	local URL_2024      = "https://raw.githubusercontent.com/eloredo413-hue/2024/main/2024"
+	local URL_2024      = "https://raw.githubusercontent.com/eloredo413-hue/2024/main/bloxy-paradox/2024-gui.lua"
 	local URL_2023_OLD  = "https://gist.githubusercontent.com/eloredo413-hue/820f4614fccf5cadbd8d84b18ee1635c/raw/6adda6838d3df2e8bd7533c1161eb0585093c2bd/2023%2520old"
 	local URL_2021      = "https://gist.githubusercontent.com/eloredo413-hue/46ee252aa3b7420b76431369e2d5e091/raw/02e4c126aecb5efa720a257e005aa319ac7fe43b/2021%2520gui"
 	local URL_2019      = "https://gist.githubusercontent.com/eloredo413-hue/2c867970649c45c8bf1eef42c7463787/raw/06e46c2ece7121a20c45728a86644d1d1e7b1e9d/2019%2520gui"
@@ -95,7 +95,7 @@ do
 
 			-- "new" is what the old "2023 new" button set.
 			if variant == "2024" or variant == "new" then
-				print("[2024 Hook] Loading the 2024 top bar...")
+				print("[2024 Hook] Loading the 2024 GUI (2023 flags + 2024 top bar)...")
 				local src = fetchURL(URL_2024, "2024")
 				if src then return _ORIG_LS(src, name) end
 				warn("[2024 Hook] Fetch failed — falling back to base 2023.")

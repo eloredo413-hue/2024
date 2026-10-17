@@ -7,7 +7,7 @@
 -- + Player dialog bubbles render perfectly (Folder host)
 -- + Regular Chat Bubbles 100% Untouched
 -- + 2015/2016 use the 2017 chat bubbles (only after Confirm, only when 2015 or 2016 is chosen)
--- + "2024" topbar (was "2023 new"): loads the 2024 top bar on Confirm, without the 2023 chat icon
+-- + "2024" topbar (was "2023 new"): the 2023 new GUI's fast flags + the 2024 top bar, without its chat icon
 --========================================================
 
 if getgenv().ClassicDialogCleanup then
