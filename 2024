@@ -154,7 +154,7 @@ if type(LocalEnv.OldChrome2024Config) == "table" then
 end
 
 -- Printed at startup, to tell copies apart.
-local BUILD = "touch-safe 9"
+local BUILD = "touch-safe 10"
 
 -- Nothing pops up on screen. What the script did is printed to the
 -- console and kept in getgenv().OldChrome2024Status.
@@ -2170,8 +2170,9 @@ end
 --
 -- On a phone, scripts other than this one (checkcaller) read
 -- PreferredInput as Touch and MouseEnabled / KeyboardEnabled as false,
--- and other scripts' fake keyboard and mouse events are dropped (a left
--- click becomes a touch tap, so the button it aimed at still works).
+-- and other scripts' fake key presses are dropped. Fake mouse clicks
+-- still go through: on some executors firesignal is one, and it is the
+-- only thing that reaches Roblox's menu button there.
 -- The hooks are installed once per session; later copies and unload
 -- only switch them on and off.
 --============================================================
@@ -2194,11 +2195,6 @@ if type(InputSpoof) ~= "table" then
         Methods = {
             SendKeyEvent = "drop",
             SendTextInputCharacterEvent = "drop",
-            SendMouseMoveEvent = "drop",
-            SendMouseMoveDeltaEvent = "drop",
-            SendMouseWheelEvent = "drop",
-            SendScroll = "drop",
-            SendMouseButtonEvent = "tap",
         },
     }
 
@@ -2206,6 +2202,11 @@ if type(InputSpoof) ~= "table" then
 end
 
 InputSpoof.Enabled = false
+InputSpoof.Methods.SendMouseButtonEvent = nil
+InputSpoof.Methods.SendMouseMoveEvent = nil
+InputSpoof.Methods.SendMouseMoveDeltaEvent = nil
+InputSpoof.Methods.SendMouseWheelEvent = nil
+InputSpoof.Methods.SendScroll = nil
 
 do
     local TouchOk, Touch = pcall(function()
@@ -2268,19 +2269,6 @@ do
 
                         if Action == "drop" then
                             InputSpoof.Blocked += 1
-                            return nil
-                        elseif Action == "tap" then
-                            -- SendMouseButtonEvent(x, y, button, isDown, ...)
-                            local X, Y, Button, IsDown = ...
-                            InputSpoof.Blocked += 1
-
-                            if Button == 0 and type(X) == "number" and type(Y) == "number" then
-                                local InputState = IsDown and Enum.UserInputState.Begin
-                                    or Enum.UserInputState.End
-
-                                Vim.SendTouchEvent(Vim, 9139, InputState.Value, X, Y)
-                            end
-
                             return nil
                         end
                     end
@@ -2470,9 +2458,9 @@ local function SetEscapeMenuOpen(Open)
     end
 
     -- Phones and tablets: a synthetic touch on Roblox's own button
-    -- (given up after it missed twice).
+    -- (given up after the first miss: then it never reaches it here).
     if TouchGuard.IsTouchDevice()
-        and (State.TapMisses or 0) < 2
+        and (State.TapMisses or 0) < 1
         and TapNativeMenuButton()
     then
         if WaitForMenu(Open, 1) then
