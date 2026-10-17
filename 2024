@@ -80,9 +80,19 @@ local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 
 local VirtualInputManager = nil
+local GamepadService = nil
+local ContextActionService = nil
 
 pcall(function()
     VirtualInputManager = game:GetService("VirtualInputManager")
+end)
+
+pcall(function()
+    GamepadService = game:GetService("GamepadService")
+end)
+
+pcall(function()
+    ContextActionService = game:GetService("ContextActionService")
 end)
 
 --============================================================
@@ -114,7 +124,7 @@ if type(LocalEnv.OldChrome2024Config) == "table" then
 end
 
 -- Shown in the startup notification and print, to tell copies apart.
-local BUILD = "touch-safe 5"
+local BUILD = "touch-safe 6"
 
 local function Log(...)
     if Config.Verbose then
@@ -656,6 +666,7 @@ local Native = {
     Backpack = nil,
     Settings = nil,
     Chrome = nil,
+    Controls = nil,
     ReportPageOpen = false,
 }
 
@@ -1156,6 +1167,16 @@ local function ClassifyNative(Value)
         and type(rawget(Value, "_subMenuConfig")) == "table"
     then
         Native.Chrome = Value
+    elseif type(rawget(Value, "controllers")) == "table" then
+        -- The game's PlayerModule ControlModule (thumbstick / jump).
+        local Index = MetaIndex(Value)
+
+        if Index
+            and type(rawget(Index, "SwitchToController")) == "function"
+            and type(rawget(Index, "UpdateTouchGuiVisibility")) == "function"
+        then
+            Native.Controls = Value
+        end
     end
 end
 
@@ -1414,6 +1435,326 @@ function Readers.report()
 end
 
 --============================================================
+-- TOUCH CONTROLS GUARD
+--============================================================
+-- On phones, opening and closing the Escape menu from here can
+-- leave the game's thumbstick and jump button hidden after the
+-- menu is gone, even after real taps. The input state from before
+-- the menu opened is remembered, and once the menu has closed
+-- whatever changed is put back.
+--============================================================
+
+local TouchGuard = {
+    Baseline = nil,
+    Generation = 0,
+    Reports = 0,
+    -- The controls were shown before an earlier menu and never came
+    -- back; the next menu still counts them as shown.
+    Lost = false,
+}
+
+-- Phones and tablets, not touch-screen laptops.
+function TouchGuard.IsTouchDevice()
+    return UserInputService.TouchEnabled == true
+        and (IsMobileDevice() or not UserInputService.MouseEnabled)
+end
+
+function TouchGuard.Read(Object, Property)
+    local Ok, Value = pcall(function()
+        return Object[Property]
+    end)
+
+    if Ok then
+        return Value
+    end
+
+    return nil
+end
+
+function TouchGuard.Short(Value)
+    return string.match(tostring(Value), "[^%.]+$")
+end
+
+function TouchGuard.FindTouchGui()
+    local Player = Players.LocalPlayer
+    local PlayerGui = Player and Player:FindFirstChildOfClass("PlayerGui")
+    local TouchGui = PlayerGui and PlayerGui:FindFirstChild("TouchGui")
+
+    if TouchGui and TouchGui:IsA("ScreenGui") then
+        return TouchGui
+    end
+
+    return nil
+end
+
+-- true / false for the PlayerModule's thumbstick and jump button,
+-- nil when the game has no TouchGui (its own controls).
+function TouchGuard.ControlsShown()
+    local TouchGui = TouchGuard.FindTouchGui()
+    local Frame = TouchGui and TouchGui:FindFirstChild("TouchControlFrame")
+
+    if not Frame then
+        return nil
+    end
+
+    if not TouchGui.Enabled or not Frame.Visible then
+        return false
+    end
+
+    for _, Child in ipairs(Frame:GetChildren()) do
+        if Child:IsA("GuiObject") and Child.Visible then
+            return true
+        end
+    end
+
+    return false
+end
+
+function TouchGuard.InTouchMode()
+    local Preferred = TouchGuard.Read(UserInputService, "PreferredInput")
+
+    if Preferred ~= nil then
+        return Preferred == Enum.PreferredInput.Touch
+    end
+
+    return UserInputService:GetLastInputType() == Enum.UserInputType.Touch
+end
+
+function TouchGuard.Snapshot()
+    if not TouchGuard.IsTouchDevice() then
+        return nil
+    end
+
+    local Shown = TouchGuard.ControlsShown()
+
+    if Shown == false and TouchGuard.Lost then
+        Shown = true
+    end
+
+    return {
+        Shown = Shown,
+        Enabled = TouchGuard.Read(GuiService, "TouchControlsEnabled"),
+        Modal = TouchGuard.Read(UserInputService, "ModalEnabled"),
+        Cursor = TouchGuard.Read(UserInputService, "OverrideMouseIconBehavior"),
+        GamepadCursor = GamepadService and TouchGuard.Read(GamepadService, "GamepadCursorEnabled"),
+    }
+end
+
+-- Puts a property back to its value from before the menu opened.
+function TouchGuard.Restore(Object, Property, Before, Fixed, Label)
+    if Before == nil then
+        return
+    end
+
+    local Now = TouchGuard.Read(Object, Property)
+
+    if Now ~= nil
+        and Now ~= Before
+        and pcall(function()
+            Object[Property] = Before
+        end)
+    then
+        table.insert(Fixed, Label)
+    end
+end
+
+-- The PlayerModule listens to TouchControlsEnabled and works out
+-- its controls again (UpdateMovementMode) when it changes.
+function TouchGuard.RefreshControls()
+    if not GuiService.TouchControlsEnabled then
+        return false
+    end
+
+    pcall(function()
+        GuiService.TouchControlsEnabled = false
+    end)
+
+    task.wait()
+
+    pcall(function()
+        GuiService.TouchControlsEnabled = true
+    end)
+
+    task.wait(0.1)
+
+    return TouchGuard.ControlsShown() == true
+end
+
+-- Last resort: switch the ControlModule (found with getgc) to its
+-- touch controller directly.
+function TouchGuard.ForceControls()
+    local Controls = Native.Controls
+    local Index = Controls and MetaIndex(Controls)
+
+    if not Index then
+        return false
+    end
+
+    pcall(function()
+        if rawget(Controls, "controlsEnabled") == false then
+            rawget(Index, "Enable")(Controls, true)
+        end
+    end)
+
+    pcall(function()
+        local Module, Success = rawget(Index, "SelectTouchModule")(Controls)
+
+        if Module and Success then
+            rawget(Index, "SwitchToController")(Controls, Module)
+        end
+    end)
+
+    pcall(function()
+        local TouchGui = rawget(Controls, "touchGui") or TouchGuard.FindTouchGui()
+        TouchGui.Enabled = true
+    end)
+
+    pcall(function()
+        rawget(Index, "UpdateActiveControlModuleEnabled")(Controls)
+    end)
+
+    task.wait(0.1)
+
+    return TouchGuard.ControlsShown() == true
+end
+
+-- One pass over everything the menu may have left behind. Returns
+-- what it changed.
+function TouchGuard.Repair(Baseline)
+    local Fixed = {}
+
+    if GuiService.MenuIsOpen then
+        return Fixed
+    end
+
+    -- SettingsHub forces the cursor on while it is open.
+    TouchGuard.Restore(UserInputService, "OverrideMouseIconBehavior", Baseline.Cursor, Fixed, "cursor")
+    TouchGuard.Restore(UserInputService, "ModalEnabled", Baseline.Modal, Fixed, "modal")
+    TouchGuard.Restore(GuiService, "TouchControlsEnabled", Baseline.Enabled, Fixed, "touch flag")
+
+    if GamepadService
+        and Baseline.GamepadCursor == false
+        and TouchGuard.Read(GamepadService, "GamepadCursorEnabled") == true
+        and pcall(function()
+            GamepadService:DisableGamepadCursor()
+        end)
+    then
+        table.insert(Fixed, "gamepad cursor")
+    end
+
+    -- SettingsHub's "stop the character" binding, in case its close
+    -- never finished. Nothing happens when it is not bound.
+    if ContextActionService then
+        pcall(function()
+            ContextActionService:UnbindCoreAction("RbxSettingsHubStopCharacter")
+        end)
+    end
+
+    if not TouchGuard.InTouchMode() then
+        RestoreTouchInput()
+        task.wait(0.05)
+        table.insert(Fixed, TouchGuard.InTouchMode() and "touch mode" or "touch mode failed")
+    end
+
+    if Baseline.Shown and TouchGuard.ControlsShown() == false then
+        if TouchGuard.RefreshControls() then
+            table.insert(Fixed, "controls refreshed")
+        elseif TouchGuard.ForceControls() then
+            table.insert(Fixed, "controls forced")
+        end
+    end
+
+    return Fixed
+end
+
+function TouchGuard.Describe()
+    local Shown = TouchGuard.ControlsShown()
+    local Controls = Native.Controls
+    local Module = "not found"
+
+    if Controls then
+        Module = rawget(Controls, "controlsEnabled") == false and "disabled" or "found"
+    end
+
+    return string.format(
+        "input %s | flag %s | cursor %s | gui %s | module %s",
+        TouchGuard.Short(TouchGuard.Read(UserInputService, "PreferredInput") or UserInputService:GetLastInputType()),
+        TouchGuard.Short(TouchGuard.Read(GuiService, "TouchControlsEnabled")),
+        TouchGuard.Short(TouchGuard.Read(UserInputService, "OverrideMouseIconBehavior")),
+        Shown == nil and "none" or (Shown and "shown" or "hidden"),
+        Module
+    )
+end
+
+-- Phones rarely show the executor console, so what was repaired
+-- (or what is still wrong) goes into a notification.
+function TouchGuard.Report(Fixed, Baseline)
+    local StillHidden = Baseline.Shown == true and TouchGuard.ControlsShown() == false
+
+    TouchGuard.Lost = StillHidden
+
+    if (#Fixed == 0 and not StillHidden) or TouchGuard.Reports >= 3 then
+        return
+    end
+
+    TouchGuard.Reports += 1
+
+    local Text = StillHidden and "Touch controls still hidden" or "Repaired after the menu closed"
+
+    if #Fixed > 0 then
+        Text ..= " (" .. table.concat(Fixed, ", ") .. ")"
+    end
+
+    Text ..= "\n" .. TouchGuard.Describe()
+
+    if Config.Verbose then
+        print("[OLD CHROME] " .. Text)
+    end
+
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title = "Old Chrome 2024 (" .. BUILD .. ")",
+            Text = Text,
+            Duration = 8,
+        })
+    end)
+end
+
+-- Runs whenever the menu closes: once after the close animation,
+-- then again for anything that changes a little later.
+function TouchGuard.OnMenuClosed()
+    local Baseline = TouchGuard.Baseline
+
+    if not Baseline or GuiService.MenuIsOpen then
+        return
+    end
+
+    TouchGuard.Generation += 1
+    local Generation = TouchGuard.Generation
+
+    task.spawn(function()
+        local Fixed = {}
+
+        for _, Delay in ipairs({ 0.4, 0.6, 1.5 }) do
+            task.wait(Delay)
+
+            if not Alive or Generation ~= TouchGuard.Generation or GuiService.MenuIsOpen then
+                return
+            end
+
+            for _, Name in ipairs(TouchGuard.Repair(Baseline)) do
+                if not table.find(Fixed, Name) then
+                    table.insert(Fixed, Name)
+                end
+            end
+        end
+
+        TouchGuard.Baseline = nil
+        TouchGuard.Report(Fixed, Baseline)
+    end)
+end
+
+--============================================================
 -- NATIVE ACTIONS
 --============================================================
 
@@ -1432,6 +1773,11 @@ end
 local function SetEscapeMenuOpen(Open)
     if GuiService.MenuIsOpen == Open then
         return true
+    end
+
+    -- Taken before anything below can hide the touch controls.
+    if Open and not TouchGuard.Baseline then
+        TouchGuard.Baseline = TouchGuard.Snapshot()
     end
 
     local Settings = Native.Settings
@@ -2793,6 +3139,10 @@ local function OnMenuStateChanged()
     -- Without SettingsHub the Report state ends with the menu.
     if not GuiService.MenuIsOpen and not Native.Settings then
         State.Active.report = false
+    end
+
+    if not GuiService.MenuIsOpen then
+        TouchGuard.OnMenuClosed()
     end
 
     SyncNativeState()
