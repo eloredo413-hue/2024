@@ -113,6 +113,9 @@ if type(LocalEnv.OldChrome2024Config) == "table" then
     end
 end
 
+-- Shown in the startup notification and print, to tell copies apart.
+local BUILD = "touch-safe 5"
+
 local function Log(...)
     if Config.Verbose then
         print("[OLD CHROME]", ...)
@@ -1218,7 +1221,7 @@ end
 -- The disabled native top bar's own Roblox button
 -- (MenuIconHolder / MenuIcon > MenuIconTriggerPoint). Its handler
 -- is SettingsHub:ToggleVisibility, so firing it needs no key event.
-local function FireNativeMenuButton()
+local function FindNativeMenuButton()
     for _, Object in ipairs(NativeTopBars) do
         for _, Name in ipairs({ "MenuIconHolder", "MenuIcon", "MenuIconTriggerPoint" }) do
             local Holder = Object:FindFirstChild(Name, true)
@@ -1227,12 +1230,18 @@ local function FireNativeMenuButton()
                     or Holder:FindFirstChildWhichIsA("GuiButton", true))
 
             if Button then
-                return FireSignal(Button.Activated)
+                return Button
             end
         end
     end
 
-    return false
+    return nil
+end
+
+local function FireNativeMenuButton()
+    local Button = FindNativeMenuButton()
+
+    return Button ~= nil and FireSignal(Button.Activated)
 end
 
 -- Calls a CoreScript's own UserInputService.InputBegan handler with a
@@ -3152,6 +3161,32 @@ task.spawn(function()
         Native.Chrome and "found" or "fallback"
     ))
 
+    -- Phones rarely show the executor console, so report the build
+    -- and how the Roblox button will reach the Escape menu on screen.
+    local MenuPath = "Escape key + touch restore"
+
+    if Native.Settings then
+        MenuPath = "SettingsHub"
+    elseif FindNativeMenuButton()
+        and (type(getconnections) == "function" or type(firesignal) == "function")
+    then
+        MenuPath = "native button"
+    end
+
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title = "Old Chrome 2024 (" .. BUILD .. ")",
+            Text = string.format(
+                "Menu: %s\ngetgc %s, getconnections %s, firesignal %s",
+                MenuPath,
+                Scanned and "yes" or "no",
+                type(getconnections) == "function" and "yes" or "no",
+                type(firesignal) == "function" and "yes" or "no"
+            ),
+            Duration = 10,
+        })
+    end)
+
     if Config.ClosePanelsOnStart then
         ClosePanelsOnStart()
     end
@@ -3163,7 +3198,7 @@ end)
 
 print("")
 print("============================================================")
-print("OLD CHROME 2024 READY  (build: touch-safe 4)")
+print("OLD CHROME 2024 READY  (build: " .. BUILD .. ")")
 print("============================================================")
 print("Original TopBarApp disabled:", #NativeTopBars)
 print("RobloxGui:", RobloxGui and "LEFT ENABLED" or "NOT FOUND")
