@@ -4639,6 +4639,208 @@ task.spawn(function()
 end)
 
 --============================================================
+-- ROOM FOR THE 2024 BAR
+--============================================================
+-- The 2023 GUI's flags give Roblox's (hidden) top bar the 2023 height,
+-- so a game's TopbarPlus buttons sit too high and run under the 2024
+-- bar, and the 2023 chat window starts under it. Like 2024 Roblox:
+-- TopbarPlus buttons line up just right of the bar (following it as
+-- it opens and closes), at the bar's height and size, and the chat
+-- window starts below the bar.
+--============================================================
+
+local BAR_GAP = 8
+local BAR_ICON_HEIGHT = 44
+
+-- Screen rectangle of the Roblox button and the unibar pill.
+local function OurBarRect()
+    if not (Frame2 and MenuIconBackground) then
+        return nil
+    end
+
+    local Origin = GuiOrigin(TopBarApp)
+    local IconTop = MenuIconBackground.AbsolutePosition + Origin
+    local PillTop = Frame2.AbsolutePosition + Origin
+    local PillEnd = PillTop + Frame2.AbsoluteSize
+
+    return {
+        Left = IconTop.X,
+        Top = math.min(IconTop.Y, PillTop.Y),
+        Right = math.max(PillEnd.X, IconTop.X + MenuIconBackground.AbsoluteSize.X),
+        Bottom = math.max(PillEnd.Y, IconTop.Y + MenuIconBackground.AbsoluteSize.Y),
+        CenterY = IconTop.Y + MenuIconBackground.AbsoluteSize.Y / 2,
+    }
+end
+
+-- Where everything we moved was, for unload.
+local Moved = {}
+
+local function Nudge(Object, DX, DY)
+    local Position = Object.Position
+
+    if Moved[Object] == nil then
+        Moved[Object] = Position
+    end
+
+    Object.Position = UDim2.new(
+        Position.X.Scale,
+        Position.X.Offset + Round(DX),
+        Position.Y.Scale,
+        Position.Y.Offset + Round(DY)
+    )
+end
+
+-- TopbarPlus (v3): PlayerGui.TopbarStandard > Holders > Left.
+local function FitGameTopbar(Bar)
+    local LocalPlayer = Players.LocalPlayer
+    local PlayerGui = LocalPlayer and LocalPlayer:FindFirstChildOfClass("PlayerGui")
+
+    if not PlayerGui then
+        return
+    end
+
+    for _, Gui in ipairs(PlayerGui:GetChildren()) do
+        local Holders = Gui:IsA("ScreenGui")
+            and string.sub(Gui.Name, 1, 6) == "Topbar"
+            and Gui:FindFirstChild("Holders")
+        local Left = Holders and Holders:FindFirstChild("Left")
+
+        if Left and Left:IsA("GuiObject") then
+            -- Its buttons the height of ours.
+            local Scale = Left:FindFirstChild("__OldChrome2024Scale")
+            local Tallest = 0
+
+            for _, Child in ipairs(Left:GetChildren()) do
+                if Child:IsA("GuiObject") and Child.Visible then
+                    Tallest = math.max(Tallest, Child.AbsoluteSize.Y)
+                end
+            end
+
+            if Tallest > 0 then
+                if not Scale then
+                    Scale = Instance.new("UIScale")
+                    Scale.Name = "__OldChrome2024Scale"
+                    Scale.Scale = 1
+                    Scale.Parent = Left
+                end
+
+                local Wanted = BAR_ICON_HEIGHT / (Tallest / Scale.Scale)
+
+                if math.abs(Scale.Scale - Wanted) > 0.01 then
+                    Scale.Scale = Wanted
+                end
+            end
+
+            -- Then just right of our bar, centred on it.
+            local Origin = GuiOrigin(Gui)
+            local Top = Left.AbsolutePosition + Origin
+            local DX = Bar.Right + BAR_GAP - Top.X
+            local Middle = Top.Y + Left.AbsoluteSize.Y / 2
+            local DY = Bar.CenterY - Middle
+
+            if Tallest > 0 then
+                -- Centre the buttons themselves, not their holder.
+                for _, Child in ipairs(Left:GetChildren()) do
+                    if Child:IsA("GuiObject") and Child.Visible then
+                        local ChildTop = Child.AbsolutePosition.Y + Origin.Y
+                        DY = Bar.CenterY - (ChildTop + Child.AbsoluteSize.Y / 2)
+                        break
+                    end
+                end
+            end
+
+            if math.abs(DX) >= 1 then
+                Nudge(Left, DX, 0)
+            end
+
+            if math.abs(DY) >= 1 then
+                Nudge(Holders, 0, DY)
+            end
+        end
+    end
+end
+
+-- The 2023 chat window (getgenv().BloxyChat2023) starts below the bar.
+local function FitChat(Bar)
+    local Chat = LocalEnv.BloxyChat2023
+
+    if typeof(Chat) ~= "Instance" or not Chat.Parent then
+        return
+    end
+
+    local Guis = { Chat }
+
+    for _, Object in ipairs(Chat:GetDescendants()) do
+        if Object:IsA("LayerCollector") then
+            table.insert(Guis, Object)
+        end
+    end
+
+    local Screen = GetViewportSize()
+
+    for _, Gui in ipairs(Guis) do
+        if Gui:IsA("LayerCollector") then
+            local Origin = GuiOrigin(Gui)
+
+            for _, Child in ipairs(Gui:GetChildren()) do
+                if Child:IsA("GuiObject") and Child.Visible then
+                    local Top = Child.AbsolutePosition + Origin
+                    local Size = Child.AbsoluteSize
+                    local Under = Top.X < Bar.Right and Top.X + Size.X > Bar.Left
+                    local Wanted = Bar.Bottom + BAR_GAP
+
+                    -- Not full-screen layers, only windows under the bar.
+                    if Under and Size.X < Screen.X * 0.7 and Top.Y < Wanted then
+                        Nudge(Child, 0, Wanted - Top.Y)
+                    end
+                end
+            end
+        end
+    end
+end
+
+local function MakeRoom()
+    local Ok, Bar = pcall(OurBarRect)
+
+    if Alive and Ok and Bar then
+        pcall(FitGameTopbar, Bar)
+        pcall(FitChat, Bar)
+    end
+end
+
+do
+    local Cleanup = LocalEnv.__OldChrome2024Cleanup
+
+    LocalEnv.__OldChrome2024Cleanup = function()
+        for Object, Position in pairs(Moved) do
+            pcall(function()
+                Object.Position = Position
+
+                local Scale = Object:FindFirstChild("__OldChrome2024Scale")
+
+                if Scale then
+                    Scale:Destroy()
+                end
+            end)
+        end
+
+        Cleanup()
+    end
+end
+
+-- Follows the bar as it opens and closes.
+if Frame2 then
+    Connect(Frame2:GetPropertyChangedSignal("AbsoluteSize"), MakeRoom)
+end
+
+task.spawn(function()
+    while Alive do
+        MakeRoom()
+        task.wait(0.25)
+    end
+end)
+
+--============================================================
 -- ICON IMAGES
 --============================================================
 -- Downloaded now, so no submenu icon is blank the first time the
