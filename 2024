@@ -73,6 +73,10 @@
 -- connections are disconnected too).
 -- getgenv().OldChrome2024Unload() restores the native top bar.
 --
+-- Run on its own, it loads the whole 2024 GUI (bloxy-paradox/2024-gui.lua):
+-- the 2023 new GUI's fast flags, a rejoin so they take effect, then this
+-- top bar and the 2023 new chat. FullGui = false loads only the top bar.
+--
 -- Settings can be overridden before executing:
 --   getgenv().OldChrome2024Config = { ClosePanelsOnStart = false }
 --   (HideCursorOnTouch / KeepTouchMode / SpoofTouchInput = false for
@@ -144,6 +148,11 @@ local Config = {
     -- the PC layout. Needs hookmetamethod; needs KeepTouchMode.
     SpoofTouchInput = true,
 
+    -- Run on its own, this script loads the whole 2024 GUI: the 2023
+    -- new GUI's fast flags, a rejoin so they take effect, then this
+    -- top bar and the 2023 new chat. False: only the top bar.
+    FullGui = true,
+
     Verbose = false,
 }
 
@@ -153,8 +162,31 @@ if type(LocalEnv.OldChrome2024Config) == "table" then
     end
 end
 
+--============================================================
+-- 2024 GUI
+--============================================================
+-- The launcher (bloxy-paradox/2024-gui.lua) sets the flags, rejoins,
+-- and then runs this script again with OldChrome2024Launching set:
+-- that run only builds the top bar.
+--============================================================
+
+local GUI_URL = "https://raw.githubusercontent.com/eloredo413-hue/2024/main/bloxy-paradox/2024-gui.lua"
+
+if LocalEnv.OldChrome2024Launching then
+    LocalEnv.OldChrome2024Launching = nil
+elseif Config.FullGui then
+    local Ok, Launcher = pcall(function()
+        return loadstring(game:HttpGet(GUI_URL))
+    end)
+
+    -- Without the launcher: the top bar alone.
+    if Ok and type(Launcher) == "function" and pcall(Launcher) then
+        return
+    end
+end
+
 -- Printed at startup, to tell copies apart.
-local BUILD = "touch-safe 10"
+local BUILD = "touch-safe 11"
 
 -- Nothing pops up on screen. What the script did is printed to the
 -- console and kept in getgenv().OldChrome2024Status.
@@ -1536,6 +1568,18 @@ local function TapButton(Button, EnableGui)
     NativeBarHold.Open = EnableGui == true
 
     local Sent = false
+    local Reached = false
+
+    -- Known within a few frames, so a miss costs a moment, not a second.
+    local Watch = nil
+
+    pcall(function()
+        Watch = Button.InputBegan:Connect(function(Input)
+            if Input.UserInputType == Enum.UserInputType.Touch then
+                Reached = true
+            end
+        end)
+    end)
 
     pcall(function()
         local Position, Size = Button.AbsolutePosition, Button.AbsoluteSize
@@ -1575,6 +1619,10 @@ local function TapButton(Button, EnableGui)
         task.wait()
     end)
 
+    if Watch then
+        Watch:Disconnect()
+    end
+
     TapGuard.Frame.Visible = false
     TapGuard.Backstop.Enabled = false
     SetProperty(MenuIconBackground, "Interactable", true)
@@ -1588,7 +1636,7 @@ local function TapButton(Button, EnableGui)
     NativeBarHold.Open = false
     State.SyntheticTouch = false
 
-    return Sent
+    return Sent, Reached or GuiService.MenuIsOpen
 end
 
 local function TapNativeMenuButton()
@@ -2433,8 +2481,80 @@ local function WaitForMenu(Open, Timeout)
     return GuiService.MenuIsOpen == Open
 end
 
+-- How the Roblox button reached the menu, kept for this session
+-- (re-executing too), so later presses go straight to it.
+local MenuMemory = LocalEnv.__OldChrome2024MenuMemory or {}
+LocalEnv.__OldChrome2024MenuMemory = MenuMemory
+
+local MenuRoutes = {}
+
+-- No input at all.
+function MenuRoutes.SettingsHub(Open)
+    local Settings = Native.Settings
+
+    return Settings ~= nil
+        and pcall(function()
+            Settings:SetVisibility(Open)
+        end)
+        and WaitForMenu(Open, 0.3)
+end
+
+-- No input: the native button's handlers, called directly.
+function MenuRoutes.handler(Open)
+    local Button = FindNativeMenuButton()
+
+    return Button ~= nil and CallHandlers(Button.Activated) and WaitForMenu(Open, 0.3)
+end
+
+-- A synthetic touch: the device stays in touch mode.
+function MenuRoutes.tap(Open)
+    if not TouchGuard.IsTouchDevice() or MenuMemory.TapMissed then
+        return false
+    end
+
+    local Sent, Reached = TapNativeMenuButton()
+
+    if Sent and WaitForMenu(Open, Reached and 1 or 0.15) then
+        return true
+    end
+
+    if Sent then
+        MenuMemory.TapMissed = true
+        Note("The tap on Roblox's own menu button missed; it is not tried again.")
+    end
+
+    return false
+end
+
+-- firesignal may click with a fake mouse: touch mode is put back.
+function MenuRoutes.firesignal(Open)
+    local Button = FindNativeMenuButton()
+
+    if not (Button and SimulateSignal(Button.Activated)) then
+        return false
+    end
+
+    local Opened = WaitForMenu(Open, 0.3)
+
+    if TouchGuard.IsTouchDevice() and not TouchGuard.InTouchMode() then
+        task.spawn(RestoreTouchInput)
+    end
+
+    return Opened
+end
+
+-- Computers only: on a phone one key event makes Roblox treat it as a
+-- computer (keyboard settings, cursor, no thumbstick).
+function MenuRoutes.key(Open)
+    return not TouchGuard.IsTouchDevice()
+        and SendKey(Enum.KeyCode.Escape)
+        and WaitForMenu(Open, 0.5)
+end
+
+local MENU_ORDER = { "SettingsHub", "handler", "tap", "firesignal", "key" }
+
 -- Opens or closes the Escape menu, preferring paths that do not
--- send key events. Yields while it waits for the menu.
+-- send input. Yields while it waits for the menu.
 local function SetEscapeMenuOpen(Open)
     if GuiService.MenuIsOpen == Open then
         return true
@@ -2445,69 +2565,33 @@ local function SetEscapeMenuOpen(Open)
         TouchGuard.Baseline = TouchGuard.Snapshot()
     end
 
-    local Settings = Native.Settings
+    local Order = table.clone(MENU_ORDER)
+    local Known = table.find(Order, MenuMemory.Route)
 
-    if Settings
-        and pcall(function()
-            Settings:SetVisibility(Open)
-        end)
-        and WaitForMenu(Open, 0.5)
-    then
-        State.MenuPath = "SettingsHub"
-        return true
+    -- The route that worked last time goes first, unless a route that
+    -- sends no input is available.
+    if Known and Known > 2 then
+        table.remove(Order, Known)
+        table.insert(Order, 3, MenuMemory.Route)
     end
 
-    -- Phones and tablets: a synthetic touch on Roblox's own button
-    -- (given up after the first miss: then it never reaches it here).
-    if TouchGuard.IsTouchDevice()
-        and (State.TapMisses or 0) < 1
-        and TapNativeMenuButton()
-    then
-        if WaitForMenu(Open, 1) then
-            State.MenuPath = "tap"
+    for _, Name in ipairs(Order) do
+        -- A slow toggle from a previous route must not be toggled back.
+        if GuiService.MenuIsOpen == Open then
             return true
         end
 
-        State.TapMisses = (State.TapMisses or 0) + 1
-
-        if State.TapMisses == 1 then
-            Note("The tap on Roblox's own menu button missed; using a fallback.")
-        end
-    end
-
-    -- A slow toggle from the step above must not be toggled back.
-    if GuiService.MenuIsOpen == Open then
-        return true
-    end
-
-    local Button = FindNativeMenuButton()
-
-    if Button then
-        -- Never both: a slow handler would be toggled twice.
-        if CallHandlers(Button.Activated) then
-            if WaitForMenu(Open, 0.5) then
-                State.MenuPath = "handler"
-                return true
-            end
-        elseif SimulateSignal(Button.Activated) and WaitForMenu(Open, 0.5) then
-            State.MenuPath = "firesignal"
+        if MenuRoutes[Name](Open) then
+            MenuMemory.Route = Name
+            State.MenuPath = Name
             return true
         end
     end
 
-    if GuiService.MenuIsOpen == Open then
-        return true
-    end
+    State.MenuPath = "none"
+    Note("The Escape menu could not be reached.")
 
-    State.MenuPath = "Escape key"
-
-    -- Never on a phone: one key event makes Roblox treat it as a computer.
-    if TouchGuard.IsTouchDevice() then
-        Note("The Escape menu could not be reached (no touch events, handlers or firesignal).")
-        return false
-    end
-
-    return SendKey(Enum.KeyCode.Escape) and WaitForMenu(Open, 1)
+    return GuiService.MenuIsOpen == Open
 end
 
 -- ChromeUtils.dismissRobloxMenuAndRun: opening a panel first

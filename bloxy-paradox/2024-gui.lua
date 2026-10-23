@@ -6,7 +6,9 @@
 -- (in the new server) loads the 2024 top bar, then the 2023 new GUI's
 -- chat (EzperienceChat). Picking 2024 again after that rejoin finds the
 -- flags already set: no second rejoin, the top bar and chat just load.
--- The 2023 GUI's chat icon (LegacyChatIcon) is not part of it.
+-- It never rejoins twice within two minutes, so an auto-execute cannot
+-- keep rejoining. The 2023 GUI's chat icon (LegacyChatIcon) is not
+-- part of it. Running the 2024 top bar script on its own runs this.
 --============================================================
 
 local TeleportService = game:GetService("TeleportService")
@@ -228,9 +230,14 @@ local scriptToRun = string.format([==[
 --============================================================*
 -- 2024 TOP BAR
 --============================================================*
+-- Tells the top bar script that this launcher runs it.
+getgenv().OldChrome2024Launching = true
+
 pcall(function()
     loadstring(game:HttpGet(%q))()
 end)
+
+getgenv().OldChrome2024Launching = nil
 
 ]==], TOP_BAR_URL) .. [==[
 --============================================================*
@@ -304,6 +311,30 @@ local function runHere()
     end)
 end
 
+-- When the last rejoin started (os.time), kept in a file because
+-- nothing else survives the teleport.
+local REJOIN_FILE = "OldChrome2024/rejoin.txt"
+
+local function lastRejoin()
+    local ok, text = pcall(function()
+        return isfile(REJOIN_FILE) and readfile(REJOIN_FILE)
+    end)
+
+    return math.max(ok and tonumber(text) or 0, tonumber(getgenv().OldChrome2024Rejoin) or 0)
+end
+
+local function rememberRejoin()
+    getgenv().OldChrome2024Rejoin = os.time()
+
+    pcall(function()
+        if not isfolder("OldChrome2024") then
+            makefolder("OldChrome2024")
+        end
+
+        writefile(REJOIN_FILE, tostring(os.time()))
+    end)
+end
+
 if flagsApplied() then
     runHere()
     return
@@ -313,13 +344,18 @@ for _, flag in ipairs(FLAGS) do
     pcall(function() setfflag(flag[1], flag[2]) end)
 end
 
--- Without queue_on_teleport nothing would load after a rejoin.
-if not queue_teleport then
+-- Nothing would load after a rejoin without queue_on_teleport, and a
+-- second rejoin right after the first would not help.
+if not queue_teleport
+    or type(setfflag) ~= "function"
+    or os.time() - lastRejoin() < 120
+    or not pcall(queue_teleport, scriptToRun)
+then
     runHere()
     return
 end
 
-queue_teleport(scriptToRun)
+rememberRejoin()
 
 pcall(function()
     TeleportService.TeleportInitFailed:Connect(function(player)
