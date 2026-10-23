@@ -7,7 +7,8 @@
 -- chat (EzperienceChat). Picking 2024 again after that rejoin finds the
 -- flags already set: no second rejoin, the top bar and chat just load.
 -- It never rejoins twice within two minutes, so an auto-execute cannot
--- keep rejoining. The 2023 GUI's chat icon (LegacyChatIcon) is not
+-- keep rejoining. One flag differs (EnableInGameMenuChrome, see FLAGS).
+-- The 2023 GUI's chat icon (LegacyChatIcon) is not
 -- part of it. Running the 2024 top bar script on its own runs this.
 --============================================================
 
@@ -115,7 +116,11 @@ local FLAGS = {
     { "EnableHomeRobloxLogo", "False" },
     { "EnableHomeRobloxLogo_IXP", "False" },
     { "EnableInExperienceShop3", "False" },
-    { "EnableInGameMenuChrome", "False" },
+    -- Left on (the 2023 GUI turns it off): with Roblox's own top bar in
+    -- its 2023 form, games draw their TopbarPlus buttons as small
+    -- squares at the 2023 height, and the chat and menu sit under the
+    -- 2024 bar. The 2024 bar replaces Roblox's top bar either way.
+    { "EnableInGameMenuChrome", "True" },
     { "EnableInGameMenuChromeABTest3", "False" },
     { "EnableInGameMenuChromeABTest4", "False" },
     { "EnableInGameMenuControls", "True" },
