@@ -43,11 +43,19 @@
 --
 -- PHONES AND TABLETS
 --
---   The Roblox button opens the menu with a synthetic touch on
---   Roblox's own (disabled) button, so the CoreScript handles it like
---   a real tap and the device stays in touch mode. The cursor is kept
---   hidden, and touch mode is restored at once if any stray keyboard
---   or mouse event switches the game out of it.
+--   Roblox's own menu button sits, invisible, on top of the 2024
+--   Roblox icon, so a tap on the icon is a real tap on Roblox's
+--   button: the menu opens at once and the device stays in touch
+--   mode. Without it, the button is pressed for you. The cursor is kept
+--   hidden. Game scripts (the thumbstick / jump button, game UI) always
+--   read PreferredInput as Touch, so a stray keyboard or mouse event
+--   never switches them to the PC layout, and Roblox's own UI is put
+--   back in touch mode once no finger is on the screen. Nothing ever
+--   covers the screen while a finger is down (a held jump button would
+--   stay stuck).
+--
+--   Nothing pops up: status goes to the console and to
+--   getgenv().OldChrome2024Status.
 --
 --   Icon states are read back from the native UI (event driven,
 --   with a light 4 Hz poll as a safety net), so the native hotkeys
@@ -66,10 +74,14 @@
 -- connections are disconnected too).
 -- getgenv().OldChrome2024Unload() restores the native top bar.
 --
+-- Run on its own, it loads the whole 2024 GUI (bloxy-paradox/2024-gui.lua):
+-- the 2023 new GUI's fast flags, a rejoin so they take effect, then this
+-- top bar and the 2023 new chat. FullGui = false loads only the top bar.
+--
 -- Settings can be overridden before executing:
 --   getgenv().OldChrome2024Config = { ClosePanelsOnStart = false }
---   (HideCursorOnTouch / KeepTouchMode = false for a tablet used
---   with a real mouse or keyboard)
+--   (HideCursorOnTouch / KeepTouchMode / SpoofTouchInput = false for
+--   a tablet used with a real mouse or keyboard)
 --
 --============================================================
 
@@ -131,6 +143,22 @@ local Config = {
     HideCursorOnTouch = true,
     KeepTouchMode = true,
 
+    -- Phones: game scripts (the PlayerModule's thumbstick and jump
+    -- button, game UI) always read UserInputService.PreferredInput as
+    -- Touch, so a stray keyboard/mouse event never switches them to
+    -- the PC layout. Needs hookmetamethod; needs KeepTouchMode.
+    SpoofTouchInput = true,
+
+    -- Roblox's own menu button is moved, invisible, on top of the 2024
+    -- Roblox icon: a tap presses the real button, so the menu opens at
+    -- once with real touch input. False: the button is pressed for you.
+    UseRealMenuButton = true,
+
+    -- Run on its own, this script loads the whole 2024 GUI: the 2023
+    -- new GUI's fast flags, a rejoin so they take effect, then this
+    -- top bar and the 2023 new chat. False: only the top bar.
+    FullGui = true,
+
     Verbose = false,
 }
 
@@ -140,8 +168,50 @@ if type(LocalEnv.OldChrome2024Config) == "table" then
     end
 end
 
--- Shown in the startup notification and print, to tell copies apart.
-local BUILD = "touch-safe 7"
+--============================================================
+-- 2024 GUI
+--============================================================
+-- The launcher (bloxy-paradox/2024-gui.lua) sets the flags, rejoins,
+-- and then runs this script again with OldChrome2024Launching set:
+-- that run only builds the top bar.
+--============================================================
+
+local GUI_URL = "https://raw.githubusercontent.com/eloredo413-hue/2024/main/bloxy-paradox/2024-gui.lua"
+
+if LocalEnv.OldChrome2024Launching then
+    LocalEnv.OldChrome2024Launching = nil
+elseif Config.FullGui then
+    local Ok, Launcher = pcall(function()
+        return loadstring(game:HttpGet(GUI_URL))
+    end)
+
+    -- Without the launcher: the top bar alone.
+    if Ok and type(Launcher) == "function" and pcall(Launcher) then
+        return
+    end
+end
+
+-- Printed at startup, to tell copies apart.
+local BUILD = "touch-safe 12"
+
+-- Nothing pops up on screen. What the script did is printed to the
+-- console and kept in getgenv().OldChrome2024Status.
+local Status = {
+    Build = BUILD,
+    Messages = {},
+}
+
+LocalEnv.OldChrome2024Status = Status
+
+local function Note(Text)
+    table.insert(Status.Messages, Text)
+
+    if #Status.Messages > 20 then
+        table.remove(Status.Messages, 1)
+    end
+
+    print("[OLD CHROME] " .. Text)
+end
 
 local function Log(...)
     if Config.Verbose then
@@ -768,8 +838,22 @@ local function IsMobileDevice()
             or Platform == Enum.Platform.Android
     end
 
-    return UserInputService.TouchEnabled
-        and not UserInputService.KeyboardEnabled
+    if not UserInputService.TouchEnabled then
+        return false
+    end
+
+    -- GetPlatform needs RobloxScript capability. Without it: phones and
+    -- tablets have motion sensors. KeyboardEnabled / MouseEnabled can't
+    -- be trusted here: a fake key or click can leave them true on a phone.
+    local SensorOk, HasSensor = pcall(function()
+        return UserInputService.AccelerometerEnabled or UserInputService.GyroscopeEnabled
+    end)
+
+    if SensorOk and HasSensor then
+        return true
+    end
+
+    return not UserInputService.KeyboardEnabled
         and not UserInputService.MouseEnabled
 end
 
@@ -1111,6 +1195,48 @@ TouchSink.Parent = TopBarApp
 
 local TOUCH_SINK_ID = 9137
 
+-- Fingers on the screen right now. Nothing may cover the screen while
+-- one is down: a held jump button whose release lands on a cover never
+-- hears it, and stays pressed.
+local ActiveTouches = {}
+
+Connect(UserInputService.TouchStarted, function(Input)
+    ActiveTouches[Input] = true
+end)
+
+Connect(UserInputService.TouchEnded, function(Input)
+    ActiveTouches[Input] = nil
+end)
+
+local function FingersDown()
+    for Input in pairs(ActiveTouches) do
+        local Ok, InputState = pcall(function()
+            return Input.UserInputState
+        end)
+
+        -- A touch whose end was never reported is not held any more.
+        if not Ok
+            or InputState == Enum.UserInputState.End
+            or InputState == Enum.UserInputState.Cancel
+        then
+            ActiveTouches[Input] = nil
+        end
+    end
+
+    return next(ActiveTouches) ~= nil
+end
+
+-- Waits (up to Timeout) for every finger to leave the screen.
+local function WaitForFingersUp(Timeout)
+    local Deadline = os.clock() + Timeout
+
+    while Alive and FingersDown() and os.clock() < Deadline do
+        task.wait()
+    end
+
+    return not FingersDown()
+end
+
 -- A synthetic key switches a touch device to keyboard-and-mouse mode:
 -- a cursor appears and the thumbstick / jump button hide. One
 -- synthetic tap on the sink switches it straight back to touch.
@@ -1119,6 +1245,7 @@ local function RestoreTouchInput()
         or not UserInputService.TouchEnabled
         or State.SyntheticTouch
         or State.NoTouchEvents
+        or FingersDown()
     then
         return
     end
@@ -1294,7 +1421,16 @@ end
 -- The disabled native top bar's own Roblox button
 -- (MenuIconHolder / MenuIcon > MenuIconTriggerPoint). Its handler
 -- is SettingsHub:ToggleVisibility, so firing it needs no key event.
+-- Roblox's own menu button once it sits inside ours (MENU ICON).
+local RealMenuButton = { Button = nil, Watch = {}, MenuChanges = 0 }
+
 local function FindNativeMenuButton()
+    local Real = RealMenuButton.Button
+
+    if Real and Real.Parent then
+        return Real
+    end
+
     for _, Object in ipairs(NativeTopBars) do
         for _, Name in ipairs({ "MenuIconHolder", "MenuIcon", "MenuIconTriggerPoint" }) do
             local Holder = Object:FindFirstChild(Name, true)
@@ -1427,14 +1563,18 @@ local function TapButton(Button, EnableGui)
     local NativeGui = Button and Button:FindFirstAncestorWhichIsA("LayerCollector")
     local Deadline = os.clock() + 0.25
 
-    -- A restore tap may be finishing.
-    while State.SyntheticTouch and os.clock() < Deadline do
+    -- A restore tap may be finishing, and the finger that tapped our
+    -- button may take a frame to be reported as lifted.
+    while (State.SyntheticTouch or FingersDown()) and os.clock() < Deadline do
         task.wait()
     end
 
+    -- Another finger is holding something (thumbstick, jump button):
+    -- covering the screen now could leave it stuck.
     if not (VirtualInputManager and NativeGui and MenuIconBackground)
         or State.SyntheticTouch
         or State.NoTouchEvents
+        or FingersDown()
     then
         return false
     end
@@ -1443,6 +1583,18 @@ local function TapButton(Button, EnableGui)
     NativeBarHold.Open = EnableGui == true
 
     local Sent = false
+    local Reached = false
+
+    -- Known within a few frames, so a miss costs a moment, not a second.
+    local Watch = nil
+
+    pcall(function()
+        Watch = Button.InputBegan:Connect(function(Input)
+            if Input.UserInputType == Enum.UserInputType.Touch then
+                Reached = true
+            end
+        end)
+    end)
 
     pcall(function()
         local Position, Size = Button.AbsolutePosition, Button.AbsoluteSize
@@ -1467,7 +1619,11 @@ local function TapButton(Button, EnableGui)
         TapGuard.Show(Screen - GuiOrigin(TopBarApp), Size)
         TapGuard.Backstop.DisplayOrder = NativeGui.DisplayOrder - 1
         TapGuard.Backstop.Enabled = true
-        SetProperty(MenuIconBackground, "Interactable", false)
+        -- Ours would catch the touch, unless the target sits inside it.
+        if not Button:IsDescendantOf(MenuIconBackground) then
+            SetProperty(MenuIconBackground, "Interactable", false)
+        end
+
         State.LastOwnActivation = os.clock()
 
         Sent = pcall(function()
@@ -1482,6 +1638,10 @@ local function TapButton(Button, EnableGui)
         task.wait()
     end)
 
+    if Watch then
+        Watch:Disconnect()
+    end
+
     TapGuard.Frame.Visible = false
     TapGuard.Backstop.Enabled = false
     SetProperty(MenuIconBackground, "Interactable", true)
@@ -1495,10 +1655,15 @@ local function TapButton(Button, EnableGui)
     NativeBarHold.Open = false
     State.SyntheticTouch = false
 
-    return Sent
+    return Sent, Reached or GuiService.MenuIsOpen
 end
 
 local function TapNativeMenuButton()
+    -- Inside our icon it is already on screen.
+    if RealMenuButton.Button then
+        return TapButton(RealMenuButton.Button, false)
+    end
+
     return TapButton(FindNativeMenuButton(), true)
 end
 
@@ -1705,7 +1870,6 @@ end
 local TouchGuard = {
     Baseline = nil,
     Generation = 0,
-    Reports = 0,
     -- The controls were shown before an earlier menu and never came
     -- back; the next menu still counts them as shown.
     Lost = false,
@@ -1945,18 +2109,16 @@ function TouchGuard.Describe()
     )
 end
 
--- Phones rarely show the executor console, so what was repaired
--- (or what is still wrong) goes into a notification.
+-- What was repaired (or what is still wrong) goes to the console and
+-- getgenv().OldChrome2024Status.
 function TouchGuard.Report(Fixed, Baseline)
     local StillHidden = Baseline.Shown == true and TouchGuard.ControlsShown() == false
 
     TouchGuard.Lost = StillHidden
 
-    if (#Fixed == 0 and not StillHidden) or TouchGuard.Reports >= 3 then
+    if #Fixed == 0 and not StillHidden then
         return
     end
-
-    TouchGuard.Reports += 1
 
     local Text = StillHidden and "Touch controls still hidden" or "Repaired after the menu closed"
 
@@ -1964,19 +2126,7 @@ function TouchGuard.Report(Fixed, Baseline)
         Text ..= " (" .. table.concat(Fixed, ", ") .. ")"
     end
 
-    Text ..= "\n" .. TouchGuard.Describe()
-
-    if Config.Verbose then
-        print("[OLD CHROME] " .. Text)
-    end
-
-    pcall(function()
-        StarterGui:SetCore("SendNotification", {
-            Title = "Old Chrome 2024 (" .. BUILD .. ")",
-            Text = Text,
-            Duration = 8,
-        })
-    end)
+    Note(Text .. " | " .. TouchGuard.Describe())
 end
 
 -- Runs whenever the menu closes: once after the close animation,
@@ -1997,6 +2147,10 @@ function TouchGuard.OnMenuClosed()
         for _, Delay in ipairs({ 0.4, 0.6, 1.5 }) do
             task.wait(Delay)
 
+            -- Never while a finger is down: refreshing the controls
+            -- under a held jump button would leave it stuck.
+            WaitForFingersUp(8)
+
             if not Alive or Generation ~= TouchGuard.Generation or GuiService.MenuIsOpen then
                 return
             end
@@ -2010,16 +2164,6 @@ function TouchGuard.OnMenuClosed()
 
         TouchGuard.Baseline = nil
         TouchGuard.Report(Fixed, Baseline)
-    end)
-end
-
-function TouchGuard.Notify(Text)
-    pcall(function()
-        StarterGui:SetCore("SendNotification", {
-            Title = "Old Chrome 2024 (" .. BUILD .. ")",
-            Text = Text,
-            Duration = 8,
-        })
     end)
 end
 
@@ -2086,6 +2230,179 @@ if Config.HideCursorOnTouch and TouchGuard.IsTouchDevice() then
 end
 
 --============================================================
+-- TOUCH MODE FOR GAME SCRIPTS
+--============================================================
+-- One keyboard or mouse event (real or fake: another script's
+-- VirtualInputManager click, a key an executor sent) makes Roblox treat
+-- a phone as a computer: PreferredInput becomes KeyboardAndMouse and
+-- MouseEnabled / KeyboardEnabled can stay true. The PlayerModule then
+-- hides the thumbstick and jump button and uses the computer movement
+-- mode (Click to Move); the Settings page lists computer options and a
+-- Shift Lock switch.
+--
+-- On a phone, scripts other than this one (checkcaller) read
+-- PreferredInput as Touch and MouseEnabled / KeyboardEnabled as false,
+-- and other scripts' fake key presses are dropped. Fake mouse clicks
+-- still go through: on some executors firesignal is one, and it is the
+-- only thing that reaches Roblox's menu button there.
+-- The hooks are installed once per session; later copies and unload
+-- only switch them on and off.
+--============================================================
+
+-- touch-safe 8 kept a PreferredInput-only hook here: switch it off.
+if type(LocalEnv.__OldChrome2024TouchSpoof) == "table" then
+    LocalEnv.__OldChrome2024TouchSpoof.Enabled = false
+end
+
+local InputSpoof = LocalEnv.__OldChrome2024InputSpoof
+
+if type(InputSpoof) ~= "table" then
+    InputSpoof = {
+        Enabled = false,
+        Values = {},
+        IndexInstalled = false,
+        NamecallInstalled = false,
+        Blocked = 0,
+        -- VirtualInputManager methods other scripts may not use on a phone.
+        Methods = {
+            SendKeyEvent = "drop",
+            SendTextInputCharacterEvent = "drop",
+        },
+    }
+
+    LocalEnv.__OldChrome2024InputSpoof = InputSpoof
+end
+
+InputSpoof.Enabled = false
+InputSpoof.Methods.SendMouseButtonEvent = nil
+InputSpoof.Methods.SendMouseMoveEvent = nil
+InputSpoof.Methods.SendMouseMoveDeltaEvent = nil
+InputSpoof.Methods.SendMouseWheelEvent = nil
+InputSpoof.Methods.SendScroll = nil
+
+do
+    local TouchOk, Touch = pcall(function()
+        return Enum.PreferredInput.Touch
+    end)
+
+    local Wanted = Config.SpoofTouchInput
+        and Config.KeepTouchMode
+        and IsMobileDevice()
+        and type(hookmetamethod) == "function"
+        and type(checkcaller) == "function"
+
+    if Wanted then
+        local Wrap = type(newcclosure) == "function" and newcclosure
+            or function(Function)
+                return Function
+            end
+
+        InputSpoof.Values.MouseEnabled = false
+        InputSpoof.Values.KeyboardEnabled = false
+
+        if TouchOk and TouchGuard.Read(UserInputService, "PreferredInput") ~= nil then
+            InputSpoof.Values.PreferredInput = Touch
+        end
+
+        if not InputSpoof.IndexInstalled then
+            local Service = UserInputService
+            local Values = InputSpoof.Values
+            local OldIndex = nil
+
+            pcall(function()
+                OldIndex = hookmetamethod(game, "__index", Wrap(function(Self, Key)
+                    if InputSpoof.Enabled and Self == Service and not checkcaller() then
+                        local Value = Values[Key]
+
+                        if Value ~= nil then
+                            return Value
+                        end
+                    end
+
+                    return OldIndex(Self, Key)
+                end))
+            end)
+
+            InputSpoof.IndexInstalled = type(OldIndex) == "function"
+        end
+
+        if not InputSpoof.NamecallInstalled
+            and VirtualInputManager
+            and type(getnamecallmethod) == "function"
+        then
+            local Vim = VirtualInputManager
+            local Methods = InputSpoof.Methods
+            local OldNamecall = nil
+
+            pcall(function()
+                OldNamecall = hookmetamethod(game, "__namecall", Wrap(function(Self, ...)
+                    if Self == Vim and InputSpoof.Enabled then
+                        local Action = Methods[getnamecallmethod()]
+
+                        if Action == "drop" then
+                            InputSpoof.Blocked += 1
+                            return nil
+                        end
+                    end
+
+                    return OldNamecall(Self, ...)
+                end))
+            end)
+
+            InputSpoof.NamecallInstalled = type(OldNamecall) == "function"
+        end
+
+        InputSpoof.Enabled = InputSpoof.IndexInstalled
+    end
+
+    local Cleanup = LocalEnv.__OldChrome2024Cleanup
+
+    LocalEnv.__OldChrome2024Cleanup = function()
+        InputSpoof.Enabled = false
+        Cleanup()
+    end
+
+    Status.InputSpoof = InputSpoof.Enabled
+    Status.FakeInputGuard = InputSpoof.Enabled and InputSpoof.NamecallInstalled
+
+    -- Controls the PlayerModule already hid before this ran: make it
+    -- look again, now that it reads Touch.
+    if InputSpoof.Enabled and not TouchGuard.InTouchMode() then
+        task.defer(function()
+            if WaitForFingersUp(5) and TouchGuard.ControlsShown() == false then
+                TouchGuard.RefreshControls()
+            end
+        end)
+    end
+end
+
+-- A phone never has shift lock. The Settings page shows its switch
+-- whenever Roblox believes a keyboard and mouse are connected.
+if TouchGuard.IsTouchDevice() and RobloxGui then
+    local function HideShiftLockRow(Object)
+        if Object.Name ~= "Shift Lock SwitchFrame" or not Object:IsA("GuiObject") then
+            return
+        end
+
+        Object.Visible = false
+
+        Connect(Object:GetPropertyChangedSignal("Visible"), function()
+            if Alive and Object.Visible then
+                Object.Visible = false
+            end
+        end)
+    end
+
+    for _, Object in ipairs(RobloxGui:GetDescendants()) do
+        pcall(HideShiftLockRow, Object)
+    end
+
+    Connect(RobloxGui.DescendantAdded, function(Object)
+        pcall(HideShiftLockRow, Object)
+    end)
+end
+
+--============================================================
 -- TOUCH MODE KEEPER
 --============================================================
 -- One keyboard or mouse event (a fake click from another script, a
@@ -2098,15 +2415,27 @@ end
 
 local TouchKeeper = {
     Last = -1,
+    Pending = false,
+    Failures = 0,
 }
 
 function TouchKeeper.Check()
+    TouchKeeper.Pending = false
+
     if not Alive
         or not Config.KeepTouchMode
         or not TouchGuard.IsTouchDevice()
+        or TouchKeeper.Failures >= 2
         or IsTextBoxFocused()
         or TouchGuard.InTouchMode()
     then
+        return
+    end
+
+    -- A finger on the screen: wait until it lifts (its own touch may
+    -- switch back by itself meanwhile).
+    if FingersDown() then
+        TouchKeeper.Pending = true
         return
     end
 
@@ -2132,8 +2461,25 @@ function TouchKeeper.Check()
     end
 
     TouchKeeper.Last = os.clock()
-    task.spawn(RestoreTouchInput)
+
+    task.spawn(function()
+        RestoreTouchInput()
+        task.wait(0.1)
+
+        -- A synthetic touch that does not bring touch mode back (the
+        -- executor's touch events count as something else) is never
+        -- tried again.
+        if not TouchGuard.InTouchMode() and not FingersDown() then
+            TouchKeeper.Failures += 1
+        end
+    end)
 end
+
+Connect(UserInputService.TouchEnded, function()
+    if TouchKeeper.Pending then
+        task.delay(0.05, TouchKeeper.Check)
+    end
+end)
 
 pcall(function()
     Connect(UserInputService:GetPropertyChangedSignal("PreferredInput"), TouchKeeper.Check)
@@ -2159,8 +2505,80 @@ local function WaitForMenu(Open, Timeout)
     return GuiService.MenuIsOpen == Open
 end
 
+-- How the Roblox button reached the menu, kept for this session
+-- (re-executing too), so later presses go straight to it.
+local MenuMemory = LocalEnv.__OldChrome2024MenuMemory or {}
+LocalEnv.__OldChrome2024MenuMemory = MenuMemory
+
+local MenuRoutes = {}
+
+-- No input at all.
+function MenuRoutes.SettingsHub(Open)
+    local Settings = Native.Settings
+
+    return Settings ~= nil
+        and pcall(function()
+            Settings:SetVisibility(Open)
+        end)
+        and WaitForMenu(Open, 0.3)
+end
+
+-- No input: the native button's handlers, called directly.
+function MenuRoutes.handler(Open)
+    local Button = FindNativeMenuButton()
+
+    return Button ~= nil and CallHandlers(Button.Activated) and WaitForMenu(Open, 0.3)
+end
+
+-- A synthetic touch: the device stays in touch mode.
+function MenuRoutes.tap(Open)
+    if not TouchGuard.IsTouchDevice() or MenuMemory.TapMissed then
+        return false
+    end
+
+    local Sent, Reached = TapNativeMenuButton()
+
+    if Sent and WaitForMenu(Open, Reached and 1 or 0.15) then
+        return true
+    end
+
+    if Sent then
+        MenuMemory.TapMissed = true
+        Note("The tap on Roblox's own menu button missed; it is not tried again.")
+    end
+
+    return false
+end
+
+-- firesignal may click with a fake mouse: touch mode is put back.
+function MenuRoutes.firesignal(Open)
+    local Button = FindNativeMenuButton()
+
+    if not (Button and SimulateSignal(Button.Activated)) then
+        return false
+    end
+
+    local Opened = WaitForMenu(Open, 0.3)
+
+    if TouchGuard.IsTouchDevice() and not TouchGuard.InTouchMode() then
+        task.spawn(RestoreTouchInput)
+    end
+
+    return Opened
+end
+
+-- Computers only: on a phone one key event makes Roblox treat it as a
+-- computer (keyboard settings, cursor, no thumbstick).
+function MenuRoutes.key(Open)
+    return not TouchGuard.IsTouchDevice()
+        and SendKey(Enum.KeyCode.Escape)
+        and WaitForMenu(Open, 0.5)
+end
+
+local MENU_ORDER = { "SettingsHub", "handler", "tap", "firesignal", "key" }
+
 -- Opens or closes the Escape menu, preferring paths that do not
--- send key events. Yields while it waits for the menu.
+-- send input. Yields while it waits for the menu.
 local function SetEscapeMenuOpen(Open)
     if GuiService.MenuIsOpen == Open then
         return true
@@ -2171,63 +2589,33 @@ local function SetEscapeMenuOpen(Open)
         TouchGuard.Baseline = TouchGuard.Snapshot()
     end
 
-    local Settings = Native.Settings
+    local Order = table.clone(MENU_ORDER)
+    local Known = table.find(Order, MenuMemory.Route)
 
-    if Settings
-        and pcall(function()
-            Settings:SetVisibility(Open)
-        end)
-        and WaitForMenu(Open, 0.5)
-    then
-        State.MenuPath = "SettingsHub"
-        return true
+    -- The route that worked last time goes first, unless a route that
+    -- sends no input is available.
+    if Known and Known > 2 then
+        table.remove(Order, Known)
+        table.insert(Order, 3, MenuMemory.Route)
     end
 
-    -- Phones and tablets: a synthetic touch on Roblox's own button
-    -- (given up after it missed twice).
-    if TouchGuard.IsTouchDevice()
-        and (State.TapMisses or 0) < 2
-        and TapNativeMenuButton()
-    then
-        if WaitForMenu(Open, 1) then
-            State.MenuPath = "tap"
+    for _, Name in ipairs(Order) do
+        -- A slow toggle from a previous route must not be toggled back.
+        if GuiService.MenuIsOpen == Open then
             return true
         end
 
-        State.TapMisses = (State.TapMisses or 0) + 1
-
-        if State.TapMisses == 1 then
-            TouchGuard.Notify("The tap on Roblox's own menu button missed; using a fallback.")
-        end
-    end
-
-    -- A slow toggle from the step above must not be toggled back.
-    if GuiService.MenuIsOpen == Open then
-        return true
-    end
-
-    local Button = FindNativeMenuButton()
-
-    if Button then
-        -- Never both: a slow handler would be toggled twice.
-        if CallHandlers(Button.Activated) then
-            if WaitForMenu(Open, 0.5) then
-                State.MenuPath = "handler"
-                return true
-            end
-        elseif SimulateSignal(Button.Activated) and WaitForMenu(Open, 0.5) then
-            State.MenuPath = "firesignal"
+        if MenuRoutes[Name](Open) then
+            MenuMemory.Route = Name
+            State.MenuPath = Name
             return true
         end
     end
 
-    if GuiService.MenuIsOpen == Open then
-        return true
-    end
+    State.MenuPath = "none"
+    Note("The Escape menu could not be reached.")
 
-    State.MenuPath = "Escape key"
-
-    return SendKey(Enum.KeyCode.Escape, true) and WaitForMenu(Open, 1)
+    return GuiService.MenuIsOpen == Open
 end
 
 -- ChromeUtils.dismissRobloxMenuAndRun: opening a panel first
@@ -2519,7 +2907,9 @@ local function ActivateReport()
         if Button then
             -- Phones: tap the tab for real, so touch mode is kept, once
             -- a tap has just proved to reach Roblox's buttons.
-            local Tapped = State.MenuPath == "tap" and TapButton(Button, false)
+            local Tapped = (State.MenuPath == "tap" or State.MenuPath == "Roblox's own button")
+                and not MenuMemory.TapMissed
+                and TapButton(Button, false)
 
             if not Tapped and not FireSignal(Button.Activated) then
                 FireSignal(Button.MouseButton1Click)
@@ -2543,6 +2933,7 @@ local function ToggleEscapeMenu()
 
     task.spawn(function()
         pcall(SetEscapeMenuOpen, not GuiService.MenuIsOpen)
+        Status.MenuPath = State.MenuPath
         State.MenuBusy = false
     end)
 end
@@ -3555,6 +3946,22 @@ local function ApplyMenuIconScale(Instant)
     end
 end
 
+local function ShowMenuIconState(Name)
+    if not MenuIconOverlay then
+        return
+    end
+
+    if Name == "Pressed" then
+        MenuIconOverlay.BackgroundColor3 = BACKGROUND_ON_PRESS.Color
+        MenuIconOverlay.BackgroundTransparency = BACKGROUND_ON_PRESS.Transparency
+    elseif Name == "Hover" then
+        MenuIconOverlay.BackgroundColor3 = BACKGROUND_ON_HOVER.Color
+        MenuIconOverlay.BackgroundTransparency = BACKGROUND_ON_HOVER.Transparency
+    else
+        MenuIconOverlay.BackgroundTransparency = 1
+    end
+end
+
 if MenuIconBackground and MenuIconBackground:IsA("GuiButton") then
     OnActivated(MenuIconBackground, function()
         -- The synthetic tap is meant for the native button below.
@@ -3567,21 +3974,255 @@ if MenuIconBackground and MenuIconBackground:IsA("GuiButton") then
     end)
 
     BindInteractable(MenuIconBackground, function(Name)
-        if not MenuIconOverlay then
-            return
-        end
+        ShowMenuIconState(Name)
+    end)
+end
 
-        if Name == "Pressed" then
-            MenuIconOverlay.BackgroundColor3 = BACKGROUND_ON_PRESS.Color
-            MenuIconOverlay.BackgroundTransparency = BACKGROUND_ON_PRESS.Transparency
-        elseif Name == "Hover" then
-            MenuIconOverlay.BackgroundColor3 = BACKGROUND_ON_HOVER.Color
-            MenuIconOverlay.BackgroundTransparency = BACKGROUND_ON_HOVER.Transparency
-        else
-            MenuIconOverlay.BackgroundTransparency = 1
+--============================================================
+-- ROBLOX'S OWN MENU BUTTON, INSIDE OURS
+--============================================================
+-- Roblox's own (hidden) menu button is moved into the 2024 Roblox
+-- icon, invisible and on top of it. A finger on the icon presses the
+-- real button, so Roblox opens or closes the menu at once with real
+-- touch input: nothing is simulated, and a phone stays in touch mode
+-- whatever the executor supports. It goes back on unload.
+--============================================================
+
+local REAL_BUTTON_PROPERTIES = {
+    "AnchorPoint", "Position", "Size", "ZIndex", "Visible", "Rotation",
+    "BackgroundTransparency", "ImageTransparency", "TextTransparency",
+}
+
+local function SetIfDifferent(Object, Property, Value)
+    pcall(function()
+        if Object[Property] ~= Value then
+            Object[Property] = Value
         end
     end)
 end
+
+-- Clickable, but nothing of it shows: our icon is what is seen.
+local function FitRealMenuButton(Button)
+    SetIfDifferent(Button, "AnchorPoint", Vector2.new(0, 0))
+    SetIfDifferent(Button, "Position", UDim2.fromScale(0, 0))
+    SetIfDifferent(Button, "Size", UDim2.fromScale(1, 1))
+    SetIfDifferent(Button, "ZIndex", MenuIconBackground.ZIndex + 20)
+    SetIfDifferent(Button, "Visible", true)
+    SetIfDifferent(Button, "Rotation", 0)
+    SetIfDifferent(Button, "BackgroundTransparency", 1)
+    SetIfDifferent(Button, "ImageTransparency", 1)
+    SetIfDifferent(Button, "TextTransparency", 1)
+
+    for _, Object in ipairs(Button:GetDescendants()) do
+        if Object:IsA("GuiObject") then
+            SetIfDifferent(Object, "Visible", false)
+        end
+    end
+end
+
+local function ReleaseRealMenuButton(PutBack)
+    local Button = RealMenuButton.Button
+
+    RealMenuButton.Button = nil
+
+    for _, Connection in ipairs(RealMenuButton.Watch) do
+        pcall(function()
+            Connection:Disconnect()
+        end)
+    end
+
+    table.clear(RealMenuButton.Watch)
+
+    -- Destroyed by Roblox: nothing to give back.
+    if not (Button and Button.Parent) then
+        return
+    end
+
+    pcall(function()
+        for Object, Visible in pairs(RealMenuButton.Hidden) do
+            if Object ~= Button and Object:IsDescendantOf(Button) then
+                Object.Visible = Visible
+            end
+        end
+
+        for Property, Value in pairs(RealMenuButton.Saved) do
+            pcall(function()
+                Button[Property] = Value
+            end)
+        end
+
+        if PutBack and Button.Parent == MenuIconBackground then
+            Button.Parent = RealMenuButton.Parent
+        end
+    end)
+end
+
+local function AdoptRealMenuButton()
+    if not Alive
+        or not Config.UseRealMenuButton
+        or RealMenuButton.Button
+        or not (MenuIconBackground and MenuIconBackground:IsA("GuiButton"))
+    then
+        return
+    end
+
+    local Button = FindNativeMenuButton()
+
+    if not Button then
+        return
+    end
+
+    -- Only the button whose own handler opens the menu.
+    local List = GetConnectionList(Button.Activated)
+
+    if List and #List == 0 then
+        return
+    end
+
+    local Parent = Button.Parent
+    local Saved, Hidden = {}, {}
+
+    for _, Property in ipairs(REAL_BUTTON_PROPERTIES) do
+        pcall(function()
+            Saved[Property] = Button[Property]
+        end)
+    end
+
+    for _, Object in ipairs(Button:GetDescendants()) do
+        if Object:IsA("GuiObject") then
+            Hidden[Object] = Object.Visible
+        end
+    end
+
+    if not pcall(function()
+        Button.Parent = MenuIconBackground
+    end) then
+        return
+    end
+
+    RealMenuButton.Button = Button
+    RealMenuButton.Parent = Parent
+    RealMenuButton.Saved = Saved
+    RealMenuButton.Hidden = Hidden
+    FitRealMenuButton(Button)
+
+    local Watch = RealMenuButton.Watch
+
+    local function Refit()
+        if RealMenuButton.Button == Button then
+            FitRealMenuButton(Button)
+        end
+    end
+
+    -- Roblox re-renders its button (hover, press): keep it invisible.
+    for _, Property in ipairs(REAL_BUTTON_PROPERTIES) do
+        pcall(function()
+            table.insert(Watch, Button:GetPropertyChangedSignal(Property):Connect(Refit))
+        end)
+    end
+
+    for Object in pairs(Hidden) do
+        table.insert(Watch, Object:GetPropertyChangedSignal("Visible"):Connect(Refit))
+    end
+
+    table.insert(Watch, Button.DescendantAdded:Connect(function(Object)
+        if Object:IsA("GuiObject") then
+            Hidden[Object] = Object.Visible
+            table.insert(Watch, Object:GetPropertyChangedSignal("Visible"):Connect(Refit))
+            Refit()
+        end
+    end))
+
+    -- Roblox rebuilt its top bar: take the new button.
+    table.insert(Watch, Button:GetPropertyChangedSignal("Parent"):Connect(function()
+        if RealMenuButton.Button == Button and Button.Parent ~= MenuIconBackground then
+            ReleaseRealMenuButton(false)
+            task.delay(0.5, AdoptRealMenuButton)
+        end
+    end))
+
+    -- Our press highlight follows the real button.
+    local Control = BindInteractable(Button, ShowMenuIconState)
+    local WasOpen = nil
+
+    table.insert(Watch, Button.InputBegan:Connect(function(Input)
+        local Type = Input.UserInputType
+
+        if Type == Enum.UserInputType.Touch or Type == Enum.UserInputType.MouseButton1 then
+            WasOpen = GuiService.MenuIsOpen
+
+            -- Taken before the menu can hide the touch controls.
+            if not WasOpen and not TouchGuard.Baseline then
+                TouchGuard.Baseline = TouchGuard.Snapshot()
+            end
+        end
+    end))
+
+    table.insert(Watch, Button.Activated:Connect(function()
+        if not Alive then
+            return
+        end
+
+        local Was = WasOpen
+        local Changes = RealMenuButton.MenuChanges
+
+        WasOpen = nil
+        State.LastOwnActivation = os.clock()
+        State.MenuPath = "Roblox's own button"
+        Status.MenuPath = State.MenuPath
+        CloseSubmenu()
+
+        if Control then
+            Control.Reset(true)
+        end
+
+        -- Roblox's handler toggles the menu at once. If it did not, the
+        -- other routes do it.
+        task.delay(0.3, function()
+            if Alive
+                and Was ~= nil
+                and RealMenuButton.MenuChanges == Changes
+                and GuiService.MenuIsOpen == Was
+                and not State.MenuBusy
+            then
+                State.MenuBusy = true
+                pcall(SetEscapeMenuOpen, not Was)
+                Status.MenuPath = State.MenuPath
+                State.MenuBusy = false
+            end
+        end)
+    end))
+end
+
+local function CountMenuChange()
+    RealMenuButton.MenuChanges += 1
+end
+
+Connect(GuiService.MenuOpened, CountMenuChange)
+Connect(GuiService.MenuClosed, CountMenuChange)
+
+do
+    local Cleanup = LocalEnv.__OldChrome2024Cleanup
+
+    LocalEnv.__OldChrome2024Cleanup = function()
+        -- Back before our top bar (its new parent) is destroyed.
+        ReleaseRealMenuButton(true)
+        Cleanup()
+    end
+end
+
+AdoptRealMenuButton()
+
+-- Native top bars can appear (or be rebuilt) later.
+task.spawn(function()
+    while Alive do
+        task.wait(1)
+
+        if not RealMenuButton.Button then
+            AdoptRealMenuButton()
+        end
+    end
+end)
 
 local function OnMenuStateChanged()
     ApplyMenuIconScale(false)
@@ -3961,11 +4602,12 @@ task.spawn(function()
         Native.Chrome and "found" or "fallback"
     ))
 
-    -- Phones rarely show the executor console, so report the build
-    -- and how the Roblox button will reach the Escape menu on screen.
+    -- How the Roblox button will reach the Escape menu (console only).
     local MenuPath = "Escape key + touch restore"
 
-    if Native.Settings then
+    if RealMenuButton.Button then
+        MenuPath = "Roblox's own button"
+    elseif Native.Settings then
         MenuPath = "SettingsHub"
     elseif FindNativeMenuButton() and VirtualInputManager and TouchGuard.IsTouchDevice() then
         MenuPath = "tap on native button"
@@ -3975,24 +4617,61 @@ task.spawn(function()
         MenuPath = "native button"
     end
 
-    pcall(function()
-        StarterGui:SetCore("SendNotification", {
-            Title = "Old Chrome 2024 (" .. BUILD .. ")",
-            Text = string.format(
-                "Menu: %s (handlers %s)\ngetgc %s, getconnections %s, firesignal %s",
-                MenuPath,
-                DescribeMenuHandlers(),
-                Scanned and "yes" or "no",
-                type(getconnections) == "function" and "yes" or "no",
-                type(firesignal) == "function" and "yes" or "no"
-            ),
-            Duration = 10,
-        })
-    end)
+    Status.PredictedMenuPath = MenuPath
+    Status.MenuHandlers = DescribeMenuHandlers()
+
+    Note(string.format(
+        "%s | menu: %s (handlers %s) | getgc %s, getconnections %s, firesignal %s, hookmetamethod %s",
+        BUILD,
+        MenuPath,
+        Status.MenuHandlers,
+        Scanned and "yes" or "no",
+        type(getconnections) == "function" and "yes" or "no",
+        type(firesignal) == "function" and "yes" or "no",
+        type(hookmetamethod) == "function" and "yes" or "no"
+    ))
+
+    Status.Device = IsMobileDevice() and "phone/tablet" or "computer"
 
     if Config.ClosePanelsOnStart then
         ClosePanelsOnStart()
     end
+end)
+
+--============================================================
+-- ICON IMAGES
+--============================================================
+-- Downloaded now, so no submenu icon is blank the first time the
+-- menu opens (Roblox only fetches an image once it is shown).
+--============================================================
+
+task.spawn(function()
+    local Images = {
+        [ATLAS_7] = true,
+        [ATLAS_8] = true,
+        [EMOTES_OFF_ASSET] = true,
+        [EMOTES_ON_ASSET] = true,
+        [PIN_OFF_ASSET] = true,
+        [PIN_ON_ASSET] = true,
+    }
+
+    for _, Object in ipairs(TopBarApp:GetDescendants()) do
+        if Object:IsA("ImageLabel") or Object:IsA("ImageButton") then
+            if Object.Image ~= "" then
+                Images[Object.Image] = true
+            end
+        end
+    end
+
+    local List = {}
+
+    for Image in pairs(Images) do
+        table.insert(List, Image)
+    end
+
+    pcall(function()
+        game:GetService("ContentProvider"):PreloadAsync(List)
+    end)
 end)
 
 --============================================================
